@@ -1,3 +1,11 @@
+Metadata-Version: 2.4
+Name: icra-sim
+Version: 0.1.0
+Summary: A lightweight Python simulator implementing the ICRA (Intelligent Clustering Routing Approach) paper.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: matplotlib>=3.7
+
 # ICRA Simulator (Python)
 
 ## About it.
@@ -212,4 +220,11 @@ This code is provided for research and educational purposes.
 
 ## ToDo List
 
-* Cross-check and match og article graphs
+* Add configurable mobility models (Gauss-Markov, Random Waypoint variants)
+* Add reproducible experiment presets (paper-like scenarios)
+* Add more detailed logging and verbose mode
+* Improve routing realism (queueing delay, buffer overflow)
+* Add additional baselines (e.g., mobility-aware clustering)
+* Add visualization of dynamic cluster formation
+* Add reproducibility seed control across all modules
+* Provide ready-to-run scripts for generating publication-style plots
