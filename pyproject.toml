@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icra-sim"
+version = "0.1.0"
+description = "A lightweight Python simulator implementing the ICRA (Intelligent Clustering Routing Approach) paper."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.7",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
