@@ -117,7 +117,8 @@ def run_simulation(
         q_strategy = QLearningStrategy(actions=actions, alpha=cfg.q_alpha, gamma=cfg.q_gamma)
 
     # Metrics accumulators
-    cluster_creation_cpu_s: Optional[float] = None
+    cluster_time_sum_s = 0.0
+    cluster_time_samples = 0
     isolation_cluster_sum = 0.0
     isolation_cluster_samples = 0
 
@@ -177,23 +178,23 @@ def run_simulation(
 
             # measure clustering CPU time only for first clustering
             start = time.perf_counter()
-            cluster_res = icra_clusterer.cluster(nodes, weights=weights)
             end = time.perf_counter()
-            if cluster_creation_cpu_s is None:
-                cluster_creation_cpu_s = end - start
+            cluster_res = icra_clusterer.cluster(nodes, weights)
+            cluster_time_sum_s += (end - start)
+            cluster_time_samples += 1
 
         elif protocol == "wca":
             start = time.perf_counter()
-            cluster_res = wca_clusterer.cluster(nodes)
             end = time.perf_counter()
-            if cluster_creation_cpu_s is None:
-                cluster_creation_cpu_s = end - start
+            cluster_res = wca_clusterer.cluster(nodes)
+            cluster_time_sum_s += (end - start)
+            cluster_time_samples += 1
         elif protocol == "dca":
             start = time.perf_counter()
-            cluster_res = dca_clusterer.cluster(nodes)
             end = time.perf_counter()
-            if cluster_creation_cpu_s is None:
-                cluster_creation_cpu_s = end - start
+            cluster_res = dca_clusterer.cluster(nodes)
+            cluster_time_sum_s += (end - start)
+            cluster_time_samples += 1
         else:
             raise ValueError(f"Unknown protocol: {protocol}")
 
@@ -208,7 +209,7 @@ def run_simulation(
         for node in nodes.values():
             if node.e_j <= 0:
                 continue
-            current_tuple = (node.role, node.cluster_head, node.is_forwarder)
+            current_tuple = (node.role == Role.CH,)
             if node.node_id in last_roles and last_roles[node.node_id] != current_tuple:
                 node.role_change_count += 1
                 interval_role_changes_by_node[node.node_id] += 1
@@ -270,9 +271,11 @@ def run_simulation(
                     Rc = sum(Rc_vals) / len(Rc_vals)
                 else:
                     Rc = 0.0
-                # Ec: energy change rate (average over nodes)
+                alive_ids = [i for i, n in nodes.items() if n.e_j > 0]
+
                 deltas = []
-                for i, node in nodes.items():
+                for i in alive_ids:
+                    node = nodes[i]
                     e_start = interval_energy_start.get(i, node.e_j)
                     if node.e0_j <= 0:
                         continue
@@ -288,7 +291,7 @@ def run_simulation(
                 q_strategy.update(last_state, last_action, reward)
 
     # ---- Final metrics ----
-    cluster_creation_cpu_s = cluster_creation_cpu_s if cluster_creation_cpu_s is not None else 0.0
+    cluster_creation_cpu_s = (cluster_time_sum_s / cluster_time_samples) if cluster_time_samples > 0 else 0.0
     avg_role = avg_role_changes(nodes)
     lifetime = first_dead_time(dead_time, sim_time_s=cfg.sim_time_s)
     dead_nodes = sum(1 for n in nodes.values() if n.e_j <= 0)
