@@ -53,11 +53,11 @@ def network_state(nodes: Dict[int, Node]) -> State:
     then round to 0.1 so each component is in {0.0,0.1,...,1.0}.
     """
     Hmax = math.log(11.0)
-    s1_vals = [n.s1 for n in nodes.values()]
-    s2_vals = [n.s2 for n in nodes.values()]
-    s3_vals = [n.s3 for n in nodes.values()]
-    s4_vals = [n.s4 for n in nodes.values()]
-
+    alive = [n for n in nodes.values() if n.e_j > 0]
+    s1_vals = [n.s1 for n in alive]
+    s2_vals = [n.s2 for n in alive]
+    s3_vals = [n.s3 for n in alive]
+    s4_vals = [n.s4 for n in alive]
     def norm_round(H: float) -> float:
         x = 0.0 if Hmax <= 0 else clamp(H / Hmax, 0.0, 1.0)
         return round(x, 1)
@@ -88,6 +88,11 @@ class QLearningStrategy:
     gamma: float = 0.0  # the paper sets gamma=0
     default_action: Action = (0.25, 0.25, 0.25, 0.25)
 
+    # ε-greedy exploration
+    epsilon: float = 0.20        # exploration probability
+    epsilon_min: float = 0.02
+    epsilon_decay: float = 0.999 # per update
+
     # Q values stored sparsely: Q[state][action] -> value
     Q: Dict[State, Dict[Action, float]] = field(default_factory=dict)
 
@@ -103,7 +108,11 @@ class QLearningStrategy:
         self.Q.setdefault(s, {})[a] = v
 
     def select_action(self, s: State) -> Action:
-        # Choose argmax_a Q[s,a], break ties uniformly
+        # ε-greedy exploration
+        if random.random() < self.epsilon:
+            return random.choice(self.actions)
+
+        # otherwise greedy argmax
         best_val = -1e18
         best_actions: List[Action] = []
         for a in self.actions:
@@ -116,9 +125,10 @@ class QLearningStrategy:
         return random.choice(best_actions) if best_actions else self.default_action
 
     def update(self, s: State, a: Action, reward: float) -> None:
-        # Q[s,a] = alpha * (reward + gamma * max Q[snext,*]) + (1-alpha) * Q[s,a]
-        # paper uses gamma=0
         old = self.get_q(s, a)
-        target = reward  # since gamma=0
+        target = reward  # gamma=0 per paper
         new = self.alpha * target + (1.0 - self.alpha) * old
         self.set_q(s, a, new)
+
+        # decay epsilon after each learning step
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)

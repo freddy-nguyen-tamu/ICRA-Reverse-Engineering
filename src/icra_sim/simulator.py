@@ -130,8 +130,9 @@ def run_simulation(
     dead_flag = {i: False for i in nodes.keys()}
 
     # Role-change tracking per interval
+# Role-change tracking per interval
     last_roles: Dict[int, Tuple[Role, Optional[int], bool]] = {}
-    interval_role_changes = 0
+    interval_role_changes_by_node: Dict[int, int] = {}
 
     # For RL reward: energy at interval start
     interval_energy_start: Dict[int, float] = {}
@@ -201,17 +202,18 @@ def run_simulation(
         isolation_cluster_sum += iso
         isolation_cluster_samples += 1
 
-        # Role-change count since last clustering
-        interval_role_changes = 0
+        # Role-change count since last clustering (per node)
+        interval_role_changes_by_node = {i: 0 for i, n in nodes.items() if n.e_j > 0}
+
         for node in nodes.values():
             if node.e_j <= 0:
                 continue
             current_tuple = (node.role, node.cluster_head, node.is_forwarder)
             if node.node_id in last_roles and last_roles[node.node_id] != current_tuple:
                 node.role_change_count += 1
-                interval_role_changes += 1
+                interval_role_changes_by_node[node.node_id] += 1
             last_roles[node.node_id] = current_tuple
-
+            
         # Store interval-start energy for reward calculation
         interval_energy_start = {i: n.e_j for i, n in nodes.items()}
 
@@ -259,10 +261,15 @@ def run_simulation(
         if protocol == "icra":
             assert q_strategy is not None
             if last_state is not None and last_action is not None:
-                # Rc: stability based on average role changes per node in this interval
-                avg_changes_interval = interval_role_changes / max(1, len([n for n in nodes.values() if n.e_j > 0]))
-                Rc = 1.0 if avg_changes_interval < cfg.role_change_threshold else -1.0
-
+                alive_ids = [i for i, n in nodes.items() if n.e_j > 0]
+                if alive_ids:
+                    Rc_vals = [
+                        1.0 if interval_role_changes_by_node.get(i, 0) < cfg.role_change_threshold else -1.0
+                        for i in alive_ids
+                    ]
+                    Rc = sum(Rc_vals) / len(Rc_vals)
+                else:
+                    Rc = 0.0
                 # Ec: energy change rate (average over nodes)
                 deltas = []
                 for i, node in nodes.items():

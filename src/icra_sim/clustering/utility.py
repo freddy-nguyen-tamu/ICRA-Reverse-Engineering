@@ -43,12 +43,15 @@ def compute_factors(
     deg = len(node.neighbors)
     s2 = deg / max(1, (n_total - 1))
 
-    # s3: velocity similarity with neighbors (mean similarity) in [0,1]
+    # s3: velocity similarity variance (Eq.12-ish), then invert so "bigger is better"
     if deg == 0:
         s3 = 0.0
     else:
         sims = [velocity_similarity(node, nodes[j], v_max=v_max) for j in node.neighbors]
-        s3 = clamp(mean(sims), 0.0, 1.0)
+        mu = mean(sims)
+        var = mean([(x - mu) ** 2 for x in sims])  # sims in [0,1] => var in [0,0.25]
+        var_norm = clamp(var / 0.25, 0.0, 1.0)
+        s3 = 1.0 - var_norm
 
     # s4: average link holding time with neighbors normalized to [0,1]
     if deg == 0:
