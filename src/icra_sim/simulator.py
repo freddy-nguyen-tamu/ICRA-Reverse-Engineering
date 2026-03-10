@@ -2,39 +2,25 @@ from __future__ import annotations
 
 import math
 import random
-import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from .clustering.clusterer import DCAClusterer, ICRAClusterer, WCAClusterer
+from .clustering.utility import compute_factors
 from .config import ProtocolName, ScenarioConfig, SimConfig
 from .metrics import RunMetrics, avg_role_changes, count_isolation_clusters, first_dead_time
 from .mobility.gauss_markov import GaussMarkovMobility
 from .node import Node, Role
 from .radio import build_neighbor_tables
-from .routing.router import Router
-from .clustering.clusterer import ICRAClusterer, WCAClusterer, DCAClusterer
-from .clustering.utility import compute_factors, weighted_utility
 from .rl.qlearning import QLearningStrategy, generate_action_space, network_state, reward_transform
+from .routing.router import Router
 from .utils import clamp
 
 
-def _init_positions_grid(n: int, width_m: float, height_m: float) -> List[Tuple[float, float]]:
-    """Place nodes roughly evenly in the area using a jittered grid."""
-    side = math.ceil(math.sqrt(n))
-    cell_w = width_m / side
-    cell_h = height_m / side
-
+def _init_positions_random(n: int, width_m: float, height_m: float) -> List[Tuple[float, float]]:
     positions: List[Tuple[float, float]] = []
-    for idx in range(n):
-        r = idx // side
-        c = idx % side
-        x0 = (c + 0.5) * cell_w
-        y0 = (r + 0.5) * cell_h
-        # jitter up to 10% of cell size
-        x = x0 + random.uniform(-0.1 * cell_w, 0.1 * cell_w)
-        y = y0 + random.uniform(-0.1 * cell_h, 0.1 * cell_h)
-        positions.append((clamp(x, 0.0, width_m), clamp(y, 0.0, height_m)))
-    random.shuffle(positions)
+    for _ in range(n):
+        positions.append((random.uniform(0.0, width_m), random.uniform(0.0, height_m)))
     return positions
 
 
@@ -42,6 +28,60 @@ def _init_positions_grid(n: int, width_m: float, height_m: float) -> List[Tuple[
 class SimulationResult:
     metrics: RunMetrics
     weight_history: List[Tuple[float, float, float, float]]
+
+
+def _apply_control_overhead(
+    nodes: Dict[int, Node],
+    cfg: SimConfig,
+    protocol: ProtocolName,
+) -> Tuple[float, int]:
+    """
+    Approximate control-plane cost per reclustering interval.
+    Returns (protocol_cost_s, control_messages_count)
+    """
+    alive = [n for n in nodes.values() if n.e_j > 0]
+    if not alive:
+        return 0.0, 0
+
+    msg_count = 0
+    protocol_cost_s = 0.0
+
+    # hello + utility/status advertisement to neighbors
+    for n in alive:
+        deg = len([j for j in n.neighbors if nodes[j].e_j > 0])
+        tx_msgs = 2
+        rx_msgs = 2 * deg
+
+        n.e_j -= tx_msgs * cfg.e_ctrl_tx_j
+        n.e_j -= rx_msgs * cfg.e_ctrl_rx_j
+        protocol_cost_s += tx_msgs * cfg.control_msg_proc_delay_s
+        protocol_cost_s += rx_msgs * cfg.control_msg_proc_delay_s
+        msg_count += tx_msgs + rx_msgs
+
+    # RL feedback / GS strategy exchange only for ICRA
+    if protocol == "icra":
+        for n in alive:
+            n.e_j -= cfg.e_rl_feedback_j
+            protocol_cost_s += 2.0 * cfg.control_msg_proc_delay_s
+            msg_count += 2
+
+    # CH declaration / join / join-ack
+    ch_ids = {n.node_id for n in alive if n.role == Role.CH}
+    for n in alive:
+        if n.role == Role.CH:
+            deg = len([j for j in n.neighbors if nodes[j].e_j > 0])
+            n.e_j -= cfg.e_ctrl_tx_j
+            for _ in range(deg):
+                n.e_j -= cfg.e_ctrl_rx_j
+            protocol_cost_s += (1 + deg) * cfg.control_msg_proc_delay_s
+            msg_count += 1 + deg
+        elif n.cluster_head is not None and n.cluster_head in nodes:
+            n.e_j -= cfg.e_ctrl_tx_j
+            n.e_j -= cfg.e_ctrl_rx_j
+            protocol_cost_s += 2.0 * cfg.control_msg_proc_delay_s
+            msg_count += 2
+
+    return protocol_cost_s, msg_count
 
 
 def run_simulation(
@@ -56,12 +96,12 @@ def run_simulation(
     height_m = cfg.area_km[1] * 1000.0
     comm_radius_m = cfg.comm_radius_km * 1000.0
 
-    # --- Initialize nodes ---
-    positions = _init_positions_grid(n_nodes, width_m, height_m)
+    positions = _init_positions_random(n_nodes, width_m, height_m)
     nodes: Dict[int, Node] = {}
     for i in range(n_nodes):
         x, y = positions[i]
         heading = random.uniform(-math.pi, math.pi)
+
         if scenario.constant_speed:
             speed = scenario.speed_low_m_s
         else:
@@ -82,7 +122,6 @@ def run_simulation(
             e_j=e0,
         )
 
-    # --- Models ---
     mobility = GaussMarkovMobility(
         alpha=cfg.gauss_markov_alpha,
         speed_range=(scenario.speed_low_m_s, scenario.speed_high_m_s),
@@ -96,29 +135,37 @@ def run_simulation(
         data_rate_kbps=cfg.data_rate_kbps,
         packet_size_bytes=cfg.packet_size_bytes,
         per_hop_processing_delay_s=cfg.per_hop_processing_delay_s,
+        mac_contention_delay_s=cfg.mac_contention_delay_s,
+        queueing_delay_s=cfg.queueing_delay_s,
         max_hops=cfg.max_hops,
     )
 
-    # Clusterers
     icra_clusterer = ICRAClusterer(
         comm_radius_m=comm_radius_m,
         lht_threshold_s=cfg.lht_threshold_s,
         lht_cap_s=cfg.lht_cap_s,
         v_max=scenario.speed_high_m_s,
+        join_hysteresis_margin=cfg.join_hysteresis_margin,
     )
     wca_clusterer = WCAClusterer(comm_radius_m=comm_radius_m)
     dca_clusterer = DCAClusterer(comm_radius_m=comm_radius_m, lht_cap_s=cfg.lht_cap_s)
 
-    # RL strategy for ICRA
     weight_history: List[Tuple[float, float, float, float]] = []
     q_strategy: Optional[QLearningStrategy] = None
     if protocol == "icra":
         actions = generate_action_space(step=0.05)
-        q_strategy = QLearningStrategy(actions=actions, alpha=cfg.q_alpha, gamma=cfg.q_gamma)
+        q_strategy = QLearningStrategy(
+            actions=actions,
+            alpha=cfg.q_alpha,
+            gamma=cfg.q_gamma,
+            epsilon=cfg.q_epsilon,
+            epsilon_min=cfg.q_epsilon_min,
+            epsilon_decay=cfg.q_epsilon_decay,
+        )
 
-    # Metrics accumulators
-    cluster_time_sum_s = 0.0
-    cluster_time_samples = 0
+    cluster_cost_sum_s = 0.0
+    cluster_cost_samples = 0
+
     isolation_cluster_sum = 0.0
     isolation_cluster_samples = 0
 
@@ -126,33 +173,22 @@ def run_simulation(
     packets_delivered = 0
     delay_sum_s = 0.0
 
-    # Dead-node tracking
     dead_time: Dict[int, float] = {}
     dead_flag = {i: False for i in nodes.keys()}
 
-    # Role-change tracking per interval
-# Role-change tracking per interval
-    last_roles: Dict[int, Tuple[Role, Optional[int], bool]] = {}
+    last_roles: Dict[int, bool] = {}
     interval_role_changes_by_node: Dict[int, int] = {}
-
-    # For RL reward: energy at interval start
     interval_energy_start: Dict[int, float] = {}
 
-    # RL: last (state, action) for update
-    last_state = None
-    last_action = None
+    prev_state = None
+    prev_action = None
 
-    # Initial neighbor table
     build_neighbor_tables(nodes, comm_radius_m=comm_radius_m)
 
-    # --- Main loop (interval-based) ---
     t = 0.0
     while t < cfg.sim_time_s:
-        # ---- (Re)clustering round ----
-        # (1) Update neighbor tables at this moment
         build_neighbor_tables(nodes, comm_radius_m=comm_radius_m)
 
-        # (2) For ICRA: compute state (entropy over factor distributions)
         if protocol == "icra":
             assert q_strategy is not None
             for node in nodes.values():
@@ -166,65 +202,55 @@ def run_simulation(
                     lht_cap_s=cfg.lht_cap_s,
                     v_max=scenario.speed_high_m_s,
                 )
-                node.s1, node.s2, node.s3, node.s4 = (
-                    factors.s1_energy, factors.s2_degree, factors.s3_vel_sim, factors.s4_lht
-                )
+                node.s1 = factors.s1_energy
+                node.s2 = factors.s2_degree
+                node.s3 = factors.s3_vel_sim
+                node.s4 = factors.s4_lht
 
             s = network_state(nodes)
             a = q_strategy.select_action(s)
             weights = a
-            last_state, last_action = s, a
+            prev_state, prev_action = s, a
             weight_history.append(weights)
 
-            # measure clustering CPU time only for first clustering
-            start = time.perf_counter()
-            end = time.perf_counter()
-            cluster_res = icra_clusterer.cluster(nodes, weights)
-            cluster_time_sum_s += (end - start)
-            cluster_time_samples += 1
-
+            cluster_res = icra_clusterer.cluster(nodes, weights=weights, factors_already_set=True)
         elif protocol == "wca":
-            start = time.perf_counter()
-            end = time.perf_counter()
             cluster_res = wca_clusterer.cluster(nodes)
-            cluster_time_sum_s += (end - start)
-            cluster_time_samples += 1
         elif protocol == "dca":
-            start = time.perf_counter()
-            end = time.perf_counter()
             cluster_res = dca_clusterer.cluster(nodes)
-            cluster_time_sum_s += (end - start)
-            cluster_time_samples += 1
         else:
             raise ValueError(f"Unknown protocol: {protocol}")
 
-        # Isolation clusters sample
-        iso = count_isolation_clusters(cluster_res.clusters, threshold=2)
+        # protocol cost, not Python CPU time
+        protocol_cost_s, _ = _apply_control_overhead(nodes, cfg, protocol)
+        cluster_cost_sum_s += protocol_cost_s
+        cluster_cost_samples += 1
+
+        iso = count_isolation_clusters(cluster_res.clusters, threshold=1)
         isolation_cluster_sum += iso
         isolation_cluster_samples += 1
 
-        # Role-change count since last clustering (per node)
         interval_role_changes_by_node = {i: 0 for i, n in nodes.items() if n.e_j > 0}
 
         for node in nodes.values():
             if node.e_j <= 0:
                 continue
-            current_tuple = (node.role == Role.CH,)
-            if node.node_id in last_roles and last_roles[node.node_id] != current_tuple:
+            current_is_ch = node.role == Role.CH
+            prev_is_ch = last_roles.get(node.node_id, None)
+
+            if prev_is_ch is not None and prev_is_ch != current_is_ch:
                 node.role_change_count += 1
                 interval_role_changes_by_node[node.node_id] += 1
-            last_roles[node.node_id] = current_tuple
-            
-        # Store interval-start energy for reward calculation
+
+            last_roles[node.node_id] = current_is_ch
+
         interval_energy_start = {i: n.e_j for i, n in nodes.items()}
 
-        # ---- Simulate within this clustering interval ----
         steps = int(cfg.clustering_interval_s / cfg.dt_s)
         for _ in range(steps):
             if t >= cfg.sim_time_s:
                 break
 
-            # Mobility and neighbor discovery
             for node in nodes.values():
                 if node.e_j <= 0:
                     continue
@@ -232,37 +258,50 @@ def run_simulation(
 
             build_neighbor_tables(nodes, comm_radius_m=comm_radius_m)
 
-            # Traffic & routing (only alive nodes)
             alive_ids = [i for i, n in nodes.items() if n.e_j > 0]
             if len(alive_ids) >= 2:
                 for i in alive_ids:
                     if random.random() < cfg.packet_gen_prob_per_s * cfg.dt_s:
-                        dst = random.choice([x for x in alive_ids if x != i])
+                        dst_choices = [x for x in alive_ids if x != i]
+                        if not dst_choices:
+                            continue
+                        dst = random.choice(dst_choices)
                         packets_generated += 1
                         result = router.route(nodes, src=i, dst=dst)
+
+                        path = list(result.path)
+                        for u, v in zip(path, path[1:]):
+                            if nodes[u].e_j > 0:
+                                nodes[u].e_j -= cfg.e_tx_j
+                            if nodes[v].e_j > 0:
+                                nodes[v].e_j -= cfg.e_rx_j
+                            if nodes[u].role == Role.CH and nodes[u].e_j > 0:
+                                nodes[u].e_j -= cfg.e_ch_proc_j
+
                         if result.delivered:
                             packets_delivered += 1
                             delay_sum_s += result.delay_s
 
-            # Energy consumption
             for node in nodes.values():
                 if node.e_j <= 0:
                     continue
-                drain = cfg.en_j_per_s
+
                 if node.role in (Role.CH, Role.FORWARDER):
-                    drain = cfg.ehf_j_per_s
-                node.e_j -= drain * cfg.dt_s
+                    node.e_j -= cfg.ehf_j_per_s * cfg.dt_s
+                else:
+                    node.e_j -= cfg.en_j_per_s * cfg.dt_s
+
                 if node.e_j <= 0 and not dead_flag[node.node_id]:
                     dead_flag[node.node_id] = True
                     dead_time[node.node_id] = t
 
             t += cfg.dt_s
 
-        # ---- RL update at end of interval ----
         if protocol == "icra":
             assert q_strategy is not None
-            if last_state is not None and last_action is not None:
+            if prev_state is not None and prev_action is not None:
                 alive_ids = [i for i, n in nodes.items() if n.e_j > 0]
+
                 if alive_ids:
                     Rc_vals = [
                         1.0 if interval_role_changes_by_node.get(i, 0) < cfg.role_change_threshold else -1.0
@@ -271,7 +310,6 @@ def run_simulation(
                     Rc = sum(Rc_vals) / len(Rc_vals)
                 else:
                     Rc = 0.0
-                alive_ids = [i for i, n in nodes.items() if n.e_j > 0]
 
                 deltas = []
                 for i in alive_ids:
@@ -281,6 +319,7 @@ def run_simulation(
                         continue
                     delta = (e_start - node.e_j) / node.e0_j
                     deltas.append(delta)
+
                 deltaE = sum(deltas) / len(deltas) if deltas else 0.0
                 Ec = 1.0 - 2.0 * deltaE
                 Ec = clamp(Ec, -1.0, 1.0)
@@ -288,10 +327,9 @@ def run_simulation(
                 r = cfg.reward_lambda * Rc + (1.0 - cfg.reward_lambda) * Ec
                 r = clamp(r, -1.0, 1.0)
                 reward = reward_transform(r)
-                q_strategy.update(last_state, last_action, reward)
+                q_strategy.update(prev_state, prev_action, reward)
 
-    # ---- Final metrics ----
-    cluster_creation_cpu_s = (cluster_time_sum_s / cluster_time_samples) if cluster_time_samples > 0 else 0.0
+    cluster_creation_cost_s = (cluster_cost_sum_s / cluster_cost_samples) if cluster_cost_samples > 0 else 0.0
     avg_role = avg_role_changes(nodes)
     lifetime = first_dead_time(dead_time, sim_time_s=cfg.sim_time_s)
     dead_nodes = sum(1 for n in nodes.values() if n.e_j <= 0)
@@ -301,7 +339,7 @@ def run_simulation(
     avg_iso = (isolation_cluster_sum / isolation_cluster_samples) if isolation_cluster_samples > 0 else 0.0
 
     metrics = RunMetrics(
-        cluster_creation_time_s=cluster_creation_cpu_s,
+        cluster_creation_time_s=cluster_creation_cost_s,
         avg_role_changes=avg_role,
         network_lifetime_s=lifetime,
         dead_nodes=dead_nodes,

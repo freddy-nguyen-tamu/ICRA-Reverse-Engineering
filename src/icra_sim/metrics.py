@@ -22,7 +22,7 @@ class RunMetrics:
     packet_delivery_ratio: float
 
 
-def count_isolation_clusters(clusters: Dict[int, List[int]], threshold: int = 2) -> int:
+def count_isolation_clusters(clusters: Dict[int, List[int]], threshold: int = 1) -> int:
     return sum(1 for members in clusters.values() if len(members) <= threshold)
 
 

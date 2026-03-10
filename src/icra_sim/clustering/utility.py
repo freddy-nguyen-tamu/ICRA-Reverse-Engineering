@@ -2,17 +2,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 from ..link import link_holding_time_s
 from ..node import Node
-from ..utils import clamp, euclidean, mean, wrap_angle_rad
+from ..utils import clamp, mean, wrap_angle_rad
 
 
 def velocity_similarity(node_i: Node, node_j: Node, v_max: float) -> float:
-    """Larger = bigger similarity  in [0,1]
-    Normalized distance d = sqrt( (Δv/v_max)^2 + (Δθ/pi)^2 ),
-    map to similarity with 1/(1+d) (Eq.(10))
+    """
+    Larger = more similar, in [0,1].
     """
     dv = abs(node_i.speed_m_s - node_j.speed_m_s) / max(1e-9, v_max)
     dtheta = abs(wrap_angle_rad(node_i.heading_rad - node_j.heading_rad)) / math.pi
@@ -39,21 +38,18 @@ def compute_factors(
     # s1: residual energy ratio
     s1 = clamp(node.e_j / max(1e-9, node.e0_j), 0.0, 1.0)
 
-    # s2: degree centrality in [0,1]
+    # s2: degree centrality
     deg = len(node.neighbors)
     s2 = deg / max(1, (n_total - 1))
 
-    # s3: velocity similarity (paper Eq.(12) resembles variance; convert to "higher is better")
+    # s3: mean velocity similarity to neighbors
     if deg == 0:
         s3 = 0.0
     else:
-        vals = [velocity_similarity(node, nodes[j], v_max=v_max) for j in node.neighbors]  # Vij-like values in [0,1]
-        v_bar = mean(vals)
-        var = mean([(v - v_bar) ** 2 for v in vals])  # variance-style raw measure
-        s3 = 1.0 / (1.0 + var)                        # monotonic map: lower variance => higher score
-        s3 = clamp(s3, 0.0, 1.0)
+        vals = [velocity_similarity(node, nodes[j], v_max=v_max) for j in node.neighbors]
+        s3 = clamp(mean(vals), 0.0, 1.0)
 
-    # s4: average link holding time with neighbors normalized to [0,1]
+    # s4: average link holding time
     if deg == 0:
         s4 = 0.0
     else:
@@ -65,4 +61,9 @@ def compute_factors(
 
 def weighted_utility(factors: UtilityFactors, weights: Tuple[float, float, float, float]) -> float:
     w1, w2, w3, w4 = weights
-    return w1 * factors.s1_energy + w2 * factors.s2_degree + w3 * factors.s3_vel_sim + w4 * factors.s4_lht
+    return (
+        w1 * factors.s1_energy
+        + w2 * factors.s2_degree
+        + w3 * factors.s3_vel_sim
+        + w4 * factors.s4_lht
+    )
