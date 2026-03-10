@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .clustering.clusterer import DCAClusterer, ICRAClusterer, WCAClusterer
 from .clustering.utility import compute_factors
 from .config import ProtocolName, ScenarioConfig, SimConfig
-from .metrics import RunMetrics, avg_role_changes, count_isolation_clusters, first_dead_time
+from .metrics import RunMetrics, avg_role_changes, first_dead_time
 from .mobility.gauss_markov import GaussMarkovMobility
 from .node import Node, Role
 from .radio import build_neighbor_tables
@@ -59,6 +59,16 @@ class SimulationResult:
 def _init_runtime_fields(nodes: Dict[int, Node]) -> None:
     for node in nodes.values():
         setattr(node, "traffic_load_score", 0.0)
+        setattr(node, "relay_load_score", 0.0)
+        setattr(node, "path_reuse_score", 0.0)
+
+        setattr(node, "member_tx_count", 0.0)
+        setattr(node, "relay_tx_count", 0.0)
+        setattr(node, "backbone_tx_count", 0.0)
+        setattr(node, "backbone_rx_count", 0.0)
+        setattr(node, "ch_service_count", 0.0)
+        setattr(node, "path_reuse_count", 0.0)
+
         setattr(node, "ch_cooldown_s", 0.0)
         setattr(node, "recent_role_switches", 0.0)
 
@@ -75,7 +85,7 @@ def _apply_control_overhead(
     nodes: Dict[int, Node],
     cfg: SimConfig,
     clusters: Dict[int, List[int]],
-    forwarders: set[int],
+    forwarders: Set[int],
     protocol: ProtocolName,
 ) -> float:
     alive_nodes = [n for n in nodes.values() if n.e_j > 0]
@@ -85,36 +95,35 @@ def _apply_control_overhead(
 
     time_cost_s = _protocol_cluster_time(protocol, cfg, n_alive)
 
-    # control energy cost per protocol
-    # ICRA: one-shot CH election + maintained structure + GS-side RL
-    # DCA: static six-factor local election
-    # WCA: repeated CH elections with more flooding
     ctrl_scale = {
-        "icra": 0.90,
-        "dca": 1.05,
-        "wca": 1.35,
+        "icra": 0.94,
+        "dca": 1.03,
+        "wca": 1.30,
     }[protocol]
 
     for n in alive_nodes:
         n.e_j -= ctrl_scale * cfg.e_ctrl_tx_j
         for j in n.neighbors:
             if j in nodes and nodes[j].e_j > 0:
-                nodes[j].e_j -= 0.25 * ctrl_scale * cfg.e_ctrl_rx_j
+                nodes[j].e_j -= 0.22 * ctrl_scale * cfg.e_ctrl_rx_j
 
     for ch, members in clusters.items():
         if ch not in nodes or nodes[ch].e_j <= 0:
             continue
 
         fanout = max(0, len(members) - 1)
-        nodes[ch].e_j -= ctrl_scale * (cfg.e_ctrl_tx_j + 0.20 * fanout * cfg.e_ctrl_rx_j)
+        nodes[ch].e_j -= ctrl_scale * (
+            cfg.e_ctrl_tx_j
+            + 0.15 * fanout * cfg.e_ctrl_rx_j
+        )
         for m in members:
             if m == ch or m not in nodes or nodes[m].e_j <= 0:
                 continue
-            nodes[m].e_j -= 0.45 * ctrl_scale * cfg.e_ctrl_tx_j
+            nodes[m].e_j -= 0.38 * ctrl_scale * cfg.e_ctrl_tx_j
 
     for f in forwarders:
         if f in nodes and nodes[f].e_j > 0:
-            nodes[f].e_j -= 0.25 * ctrl_scale * (cfg.e_ctrl_tx_j + cfg.e_ctrl_rx_j)
+            nodes[f].e_j -= 0.20 * ctrl_scale * (cfg.e_ctrl_tx_j + cfg.e_ctrl_rx_j)
 
     for n in nodes.values():
         n.e_j = max(0.0, n.e_j)
@@ -126,10 +135,18 @@ def _apply_steady_energy(nodes: Dict[int, Node], cfg: SimConfig, dt_s: float) ->
     for node in nodes.values():
         if node.e_j <= 0:
             continue
-        if node.role in (Role.CH, Role.FORWARDER):
-            node.e_j -= cfg.ehf_j_per_s * dt_s
-        else:
-            node.e_j -= cfg.en_j_per_s * dt_s
+
+        base = cfg.en_j_per_s * dt_s
+        if node.role == Role.CH:
+            base += cfg.ch_idle_extra_j_per_s * dt_s
+        elif node.role == Role.FORWARDER:
+            base += cfg.forwarder_idle_extra_j_per_s * dt_s
+
+        load_term = cfg.load_energy_scale_j * _safe_attr(node, "traffic_load_score", 0.0)
+        relay_term = cfg.relay_load_energy_scale_j * _safe_attr(node, "relay_load_score", 0.0)
+        reuse_term = cfg.path_reuse_energy_scale_j * _safe_attr(node, "path_reuse_score", 0.0)
+
+        node.e_j -= base + load_term + relay_term + reuse_term
         node.e_j = max(0.0, node.e_j)
 
 
@@ -140,15 +157,40 @@ def _apply_path_energy(nodes: Dict[int, Node], path: Tuple[int, ...], cfg: SimCo
     for idx in range(len(path) - 1):
         u = path[idx]
         v = path[idx + 1]
-        if u in nodes and nodes[u].e_j > 0:
-            nodes[u].e_j -= cfg.e_tx_j
-        if v in nodes and nodes[v].e_j > 0:
-            nodes[v].e_j -= cfg.e_rx_j
+        if u not in nodes or v not in nodes:
+            continue
+
+        if nodes[u].e_j > 0:
+            tx_cost = cfg.e_tx_j
+            if idx > 0 and nodes[u].role == Role.CH:
+                tx_cost += cfg.e_ch_backbone_tx_j
+            elif idx > 0 and nodes[u].role == Role.FORWARDER:
+                tx_cost += cfg.e_forwarder_backbone_tx_j
+            nodes[u].e_j -= tx_cost
+
+        if nodes[v].e_j > 0:
+            rx_cost = cfg.e_rx_j
+            if idx < len(path) - 2 and nodes[v].role == Role.CH:
+                rx_cost += cfg.e_ch_service_rx_j
+            elif idx < len(path) - 2 and nodes[v].role == Role.FORWARDER:
+                rx_cost += cfg.e_forwarder_backbone_rx_j
+            nodes[v].e_j -= rx_cost
 
         if idx + 1 < len(path) - 1:
             mid = path[idx + 1]
-            if mid in nodes and nodes[mid].e_j > 0 and nodes[mid].role in (Role.CH, Role.FORWARDER):
-                nodes[mid].e_j -= cfg.e_ch_proc_j
+            if mid in nodes and nodes[mid].e_j > 0:
+                if nodes[mid].role == Role.CH:
+                    nodes[mid].e_j -= (
+                        cfg.e_ch_proc_j
+                        + cfg.e_ch_service_proc_j
+                        + cfg.e_path_reuse_surcharge_j * _safe_attr(nodes[mid], "path_reuse_score", 0.0)
+                    )
+                elif nodes[mid].role == Role.FORWARDER:
+                    nodes[mid].e_j -= (
+                        cfg.e_ch_proc_j
+                        + cfg.e_forwarder_proc_j
+                        + cfg.e_path_reuse_surcharge_j * _safe_attr(nodes[mid], "path_reuse_score", 0.0)
+                    )
 
     for node in nodes.values():
         node.e_j = max(0.0, node.e_j)
@@ -157,14 +199,83 @@ def _apply_path_energy(nodes: Dict[int, Node], path: Tuple[int, ...], cfg: SimCo
 def _update_path_load(nodes: Dict[int, Node], path: Tuple[int, ...]) -> None:
     if len(path) < 2:
         return
+
+    internal_seen: Set[int] = set()
+
     for idx, node_id in enumerate(path):
         if node_id not in nodes or nodes[node_id].e_j <= 0:
             continue
-        if idx == 0 or idx == len(path) - 1:
-            continue
+
         node = nodes[node_id]
-        prev_load = _safe_attr(node, "traffic_load_score", 0.0)
-        setattr(node, "traffic_load_score", min(1.0, prev_load + 0.10))
+
+        if idx == 0:
+            setattr(node, "member_tx_count", _safe_attr(node, "member_tx_count", 0.0) + 1.0)
+            continue
+
+        if idx == len(path) - 1:
+            continue
+
+        setattr(node, "backbone_rx_count", _safe_attr(node, "backbone_rx_count", 0.0) + 1.0)
+        setattr(node, "backbone_tx_count", _safe_attr(node, "backbone_tx_count", 0.0) + 1.0)
+
+        load = _safe_attr(node, "traffic_load_score", 0.0)
+        relay = _safe_attr(node, "relay_load_score", 0.0)
+        reuse = _safe_attr(node, "path_reuse_score", 0.0)
+
+        if node.role == Role.CH:
+            setattr(node, "ch_service_count", _safe_attr(node, "ch_service_count", 0.0) + 1.0)
+            load = min(1.0, load + 0.08)
+        elif node.role == Role.FORWARDER:
+            setattr(node, "relay_tx_count", _safe_attr(node, "relay_tx_count", 0.0) + 1.0)
+            load = min(1.0, load + 0.10)
+            relay = min(1.0, relay + 0.12)
+
+        if node_id in internal_seen:
+            setattr(node, "path_reuse_count", _safe_attr(node, "path_reuse_count", 0.0) + 1.0)
+            reuse = min(1.0, reuse + 0.18)
+        else:
+            reuse = min(1.0, reuse + 0.06)
+
+        setattr(node, "traffic_load_score", load)
+        setattr(node, "relay_load_score", relay)
+        setattr(node, "path_reuse_score", reuse)
+        internal_seen.add(node_id)
+
+    # Additional repeated-backbone penalty for nodes appearing multiple times over time.
+    for node_id in set(path[1:-1]):
+        node = nodes.get(node_id)
+        if node is None or node.e_j <= 0:
+            continue
+        tx = _safe_attr(node, "backbone_tx_count", 0.0)
+        rx = _safe_attr(node, "backbone_rx_count", 0.0)
+        repeated = max(0.0, tx + rx - 2.0)
+        if repeated > 0:
+            reuse = _safe_attr(node, "path_reuse_score", 0.0)
+            setattr(node, "path_reuse_score", min(1.0, reuse + 0.01 * repeated))
+
+
+def _count_backbone_isolation_clusters(
+    nodes: Dict[int, Node],
+    clusters: Dict[int, List[int]],
+    router: Router,
+) -> int:
+    chs = [ch for ch in clusters.keys() if ch in nodes and nodes[ch].e_j > 0]
+    if len(chs) <= 1:
+        return len(chs)
+
+    isolated = 0
+    for ch in chs:
+        reachable_other = False
+        for other in chs:
+            if other == ch:
+                continue
+            path = router._shortest_backbone_path(nodes, ch, other)
+            if path is not None and len(path) >= 2:
+                reachable_other = True
+                break
+        if not reachable_other:
+            isolated += 1
+    return isolated
 
 
 def _interval_reward(
@@ -247,10 +358,21 @@ def _decay_runtime_fields(nodes: Dict[int, Node], cfg: SimConfig) -> None:
     for node in nodes.values():
         if node.e_j <= 0:
             continue
+
         setattr(
             node,
             "traffic_load_score",
             clamp(_safe_attr(node, "traffic_load_score", 0.0) * cfg.traffic_load_decay, 0.0, 1.0),
+        )
+        setattr(
+            node,
+            "relay_load_score",
+            clamp(_safe_attr(node, "relay_load_score", 0.0) * cfg.relay_load_decay, 0.0, 1.0),
+        )
+        setattr(
+            node,
+            "path_reuse_score",
+            clamp(_safe_attr(node, "path_reuse_score", 0.0) * cfg.path_reuse_decay, 0.0, 1.0),
         )
         setattr(
             node,
@@ -262,6 +384,17 @@ def _decay_runtime_fields(nodes: Dict[int, Node], cfg: SimConfig) -> None:
             "ch_cooldown_s",
             max(0.0, _safe_attr(node, "ch_cooldown_s", 0.0) - cfg.cooldown_decay_per_round_s),
         )
+
+        # Soft decay of counters so old congestion matters less.
+        for name in (
+            "member_tx_count",
+            "relay_tx_count",
+            "backbone_tx_count",
+            "backbone_rx_count",
+            "ch_service_count",
+            "path_reuse_count",
+        ):
+            setattr(node, name, 0.70 * _safe_attr(node, name, 0.0))
 
 
 def _mark_recent_role_switches(nodes: Dict[int, Node], prev_roles: Dict[int, Role]) -> int:
@@ -398,7 +531,7 @@ def run_simulation(
     isolation_cluster_samples = 0
 
     active_clusters: Dict[int, List[int]] = {}
-    active_forwarders: set[int] = set()
+    active_forwarders: Set[int] = set()
 
     interval_energy_start: Dict[int, float] = {}
     interval_role_changes: int = 0
@@ -532,7 +665,7 @@ def run_simulation(
         _apply_steady_energy(nodes, cfg, cfg.dt_s)
 
         if active_clusters:
-            iso_now = count_isolation_clusters(active_clusters, threshold=2)
+            iso_now = _count_backbone_isolation_clusters(nodes, active_clusters, router)
             isolation_cluster_sum += iso_now
             isolation_cluster_samples += 1
             interval_isolation_sum += iso_now

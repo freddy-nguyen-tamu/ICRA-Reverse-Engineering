@@ -133,6 +133,14 @@ class ICRAClusterer:
         z = (local_deg - self.local_degree_target) / self.local_degree_tolerance
         return max(0.0, math.exp(-(z * z)))
 
+    def _count_direct_ch_neighbors(self, node: Node, alive: Dict[int, Node]) -> int:
+        count = 0
+        for j in _alive_neighbors(node, alive):
+            other = alive[j]
+            if other.role == Role.CH:
+                count += 1
+        return count
+
     def _ch_quality_bonus(self, node: Node, alive: Dict[int, Node]) -> float:
         nbrs = _alive_neighbors(node, alive)
         if not nbrs:
@@ -148,6 +156,7 @@ class ICRAClusterer:
         cooldown_penalty = min(1.0, _safe_attr(node, "ch_cooldown_s", 0.0) / max(1e-9, self.ch_cooldown_s))
         switch_penalty = _safe_attr(node, "recent_role_switches", 0.0)
         traffic_penalty = _safe_attr(node, "traffic_load_score", 0.0)
+        direct_ch_degree = _safe_attr(node, "candidate_direct_ch_degree", 0.0)
 
         bonus = 0.0
         bonus += self.degree_balance_bonus_weight * degree_balance
@@ -155,6 +164,7 @@ class ICRAClusterer:
         bonus += self.link_stability_bonus_weight * avg_lht_norm
         bonus += self.velocity_stability_bonus_weight * avg_vel
         bonus += self.prefer_connected_ch_bonus * min(1.0, len(nbrs) / max(1, self.min_ch_neighbor_count + 2))
+        bonus += 0.10 * min(1.0, direct_ch_degree / max(1.0, self.min_ch_neighbor_count + 1.0))
 
         if len(nbrs) < self.min_ch_neighbor_count:
             bonus -= self.isolated_ch_penalty
@@ -192,6 +202,34 @@ class ICRAClusterer:
         weights: Tuple[float, float, float, float],
         dt_s: float,
     ) -> List[int]:
+        for node in alive.values():
+            setattr(node, "candidate_direct_ch_degree", 0.0)
+
+        # First compute a provisional base utility.
+        provisional: Dict[int, float] = {}
+        for i, node in alive.items():
+            provisional[i] = weighted_utility(
+                compute_factors(
+                    node=node,
+                    nodes=alive,
+                    comm_radius_m=self.comm_radius_m,
+                    n_total=max(1, len(alive)),
+                    lht_cap_s=self.lht_cap_s,
+                    v_max=self.v_max,
+                ),
+                weights,
+            )
+
+        # Estimate how well each node sits in a potential CH backbone.
+        ch_like_threshold = max(0.25, sorted(provisional.values(), reverse=True)[max(0, min(len(provisional) - 1, len(provisional) // 4))])
+        for i, node in alive.items():
+            count = 0
+            for j in _alive_neighbors(node, alive):
+                if provisional.get(j, 0.0) >= ch_like_threshold:
+                    if node.neighbor_lht.get(j, 0.0) >= self.lht_threshold_s:
+                        count += 1
+            setattr(node, "candidate_direct_ch_degree", float(count))
+
         candidates: Dict[int, float] = {}
         for i, node in alive.items():
             candidates[i] = self._candidate_utility(node, weights, alive)
@@ -199,7 +237,6 @@ class ICRAClusterer:
 
         elected: Set[int] = set()
 
-        # local-max election with CH retention
         for i, node in alive.items():
             nbrs = _alive_neighbors(node, alive)
 
@@ -219,7 +256,6 @@ class ICRAClusterer:
             )
 
             if keep_current:
-                # If still good enough locally, retain CH role.
                 if candidates[i] + self.ch_retain_margin >= local_best:
                     elected.add(i)
                     continue
@@ -227,7 +263,6 @@ class ICRAClusterer:
             if local_best_id == i:
                 elected.add(i)
 
-        # avoid empty graph fragments with no CH
         covered = set(elected)
         for ch in list(elected):
             covered.update(_alive_neighbors(alive[ch], alive))
@@ -248,9 +283,25 @@ class ICRAClusterer:
     ) -> Dict[int, List[int]]:
         clusters: Dict[int, List[int]] = {ch: [ch] for ch in chs}
         ch_set = set(chs)
+        prev_cluster_heads = {i: n.cluster_head for i, n in alive.items()}
 
-        # reset roles first
+        ch_backbone_connectivity: Dict[int, float] = {}
+        for ch in chs:
+            ch_node = alive[ch]
+            direct_chs = 0
+            stable_direct_chs = 0
+            for other_ch in chs:
+                if other_ch == ch:
+                    continue
+                lht = link_holding_time_s(ch_node, alive[other_ch], self.comm_radius_m)
+                if lht >= self.lht_threshold_s:
+                    direct_chs += 1
+                if lht >= self.min_gateway_lht_s:
+                    stable_direct_chs += 1
+            ch_backbone_connectivity[ch] = min(1.0, 0.45 * direct_chs + 0.55 * stable_direct_chs)
+
         for node in alive.values():
+            node.is_forwarder = False
             if node.node_id in ch_set:
                 node.set_role(Role.CH)
                 node.cluster_head = node.node_id
@@ -259,13 +310,12 @@ class ICRAClusterer:
                 node.set_role(Role.MEMBER)
                 node.cluster_head = None
 
-        # assign every non-CH to best CH
         for i, node in alive.items():
             if i in ch_set:
                 continue
 
             options: List[Tuple[float, int]] = []
-            prev_ch = node.cluster_head
+            prev_ch = prev_cluster_heads.get(i)
 
             for ch in chs:
                 ch_node = alive[ch]
@@ -275,15 +325,22 @@ class ICRAClusterer:
                 if len(clusters[ch]) >= self.max_cluster_members:
                     continue
 
-                util_gap = ch_node.utility - node.utility
                 vel = velocity_similarity(node, ch_node)
-                score = (
-                    0.42 * ch_node.utility
-                    + 0.22 * min(lht, self.lht_cap_s) / max(1e-9, self.lht_cap_s)
-                    + 0.16 * vel
-                    + 0.10 * ch_node.s1
-                    - 0.10 * abs(util_gap)
-                )
+                util_gap = abs(ch_node.utility - node.utility)
+                load_penalty = _safe_attr(ch_node, "traffic_load_score", 0.0)
+                size_penalty = len(clusters[ch]) / max(1, self.max_cluster_members)
+                connectivity_bonus = ch_backbone_connectivity.get(ch, 0.0)
+                energy_bonus = ch_node.s1
+
+                score = 0.0
+                score += 0.33 * ch_node.utility
+                score += 0.24 * min(lht, self.lht_cap_s) / max(1e-9, self.lht_cap_s)
+                score += 0.13 * vel
+                score += 0.10 * energy_bonus
+                score += 0.14 * connectivity_bonus
+                score -= 0.08 * util_gap
+                score -= 0.12 * load_penalty
+                score -= 0.14 * size_penalty
 
                 if prev_ch is not None and ch == prev_ch:
                     score += self.join_hysteresis_margin
@@ -291,10 +348,33 @@ class ICRAClusterer:
                 options.append((score, ch))
 
             if not options:
-                # self-become-CH if no valid CH exists
-                node.set_role(Role.CH)
-                node.cluster_head = i
-                clusters[i] = [i]
+                stable_nbrs = 0
+                for j in _alive_neighbors(node, alive):
+                    if node.neighbor_lht.get(j, 0.0) >= self.lht_threshold_s:
+                        stable_nbrs += 1
+
+                # Much stricter fallback: only self-promote when genuinely isolated / unusable.
+                if stable_nbrs <= 1 and node.s1 >= self.ch_energy_guard_ratio:
+                    node.set_role(Role.CH)
+                    node.cluster_head = i
+                    clusters[i] = [i]
+                else:
+                    # Best-effort fallback to nearest reachable CH by raw LHT, even if overloaded.
+                    best_ch = None
+                    best_lht = -1.0
+                    for ch in chs:
+                        lht = link_holding_time_s(node, alive[ch], self.comm_radius_m)
+                        if lht > best_lht:
+                            best_lht = lht
+                            best_ch = ch
+                    if best_ch is None:
+                        node.set_role(Role.CH)
+                        node.cluster_head = i
+                        clusters[i] = [i]
+                    else:
+                        clusters[best_ch].append(i)
+                        node.cluster_head = best_ch
+                        node.note_cluster_membership(best_ch, dt_s)
                 continue
 
             options.sort(reverse=True)
@@ -303,7 +383,6 @@ class ICRAClusterer:
             node.cluster_head = best_ch
             node.note_cluster_membership(best_ch, dt_s)
 
-        # update CH tenure
         for ch in clusters:
             if ch in alive:
                 alive[ch].note_role_tenure(dt_s)
@@ -322,9 +401,18 @@ class ICRAClusterer:
         if node.role == Role.CH:
             return None
 
+        own_ch_node = alive.get(own_ch)
+        if own_ch_node is None:
+            return None
+
+        own_lht = link_holding_time_s(node, own_ch_node, self.comm_radius_m)
+        if own_lht < self.lht_threshold_s:
+            return None
+
         reachable: List[int] = []
         direct_ch_links = 0
         min_cross_lht = 1.0
+        mean_cross_lht = 0.0
 
         for ch in target_chs:
             if ch == own_ch:
@@ -335,14 +423,20 @@ class ICRAClusterer:
             if lht >= self.min_gateway_lht_s:
                 reachable.append(ch)
                 direct_ch_links += 1
-                min_cross_lht = min(min_cross_lht, min(lht, self.lht_cap_s) / max(1e-9, self.lht_cap_s))
+                norm = min(lht, self.lht_cap_s) / max(1e-9, self.lht_cap_s)
+                mean_cross_lht += norm
+                min_cross_lht = min(min_cross_lht, norm)
 
         if not reachable:
             return None
 
+        mean_cross_lht /= max(1, len(reachable))
         utility_norm = max(0.0, min(1.0, node.utility))
         energy_norm = node.s1
         stability_norm = 0.5 * node.s3 + 0.5 * node.s4
+        load_penalty = _safe_attr(node, "traffic_load_score", 0.0)
+        relay_penalty = _safe_attr(node, "relay_load_score", 0.0)
+        own_link_norm = min(own_lht, self.lht_cap_s) / max(1e-9, self.lht_cap_s)
 
         score = 0.0
         score += self.gateway_crosslink_weight * min(1.0, len(reachable) / 3.0)
@@ -352,9 +446,15 @@ class ICRAClusterer:
         score += self.gateway_multicluster_bonus * max(0.0, min(1.0, (len(reachable) - 1) / 2.0))
         score += self.direct_ch_link_bonus * min(1.0, direct_ch_links / 2.0)
         score += 0.08 * min_cross_lht
+        score += 0.10 * mean_cross_lht
+        score += 0.10 * own_link_norm
 
         if node.is_forwarder:
             score += self.forwarder_reuse_bonus
+
+        score -= 0.16 * load_penalty
+        score -= 0.16 * relay_penalty
+        score -= 0.14 * max(0.0, 1.0 - own_link_norm)
 
         return GatewayCandidate(
             node_id=node.node_id,
@@ -371,8 +471,21 @@ class ICRAClusterer:
         forwarders: Set[int] = set()
         chs = sorted(clusters.keys())
 
+        # Precompute direct CH reachability.
+        direct_ch_reach: Dict[int, Set[int]] = {}
+        for ch in chs:
+            direct_ch_reach[ch] = set()
+            for other_ch in chs:
+                if other_ch == ch:
+                    continue
+                lht = link_holding_time_s(alive[ch], alive[other_ch], self.comm_radius_m)
+                if lht >= self.min_gateway_lht_s:
+                    direct_ch_reach[ch].add(other_ch)
+
         for ch, members in clusters.items():
             candidates: List[GatewayCandidate] = []
+            uncovered = (set(chs) - {ch}) - direct_ch_reach.get(ch, set())
+
             for m in members:
                 if m == ch or m not in alive:
                     continue
@@ -380,23 +493,55 @@ class ICRAClusterer:
                 if cand is not None:
                     candidates.append(cand)
 
-            candidates.sort(key=lambda c: c.score, reverse=True)
-
-            covered: Set[int] = set()
             selected_local: List[GatewayCandidate] = []
-            for cand in candidates:
-                adds = set(cand.reachable_chs) - covered
+            covered = set(direct_ch_reach.get(ch, set()))
+            used_target_count: Dict[int, int] = {}
+
+            while candidates and len(selected_local) < 3:
+                best_idx = None
+                best_value = -1e18
+
+                for idx, cand in enumerate(candidates):
+                    adds = set(cand.reachable_chs) - covered
+                    overlap = len(set(cand.reachable_chs) & covered)
+                    redundancy_penalty = sum(used_target_count.get(x, 0) for x in cand.reachable_chs)
+
+                    value = cand.score
+                    value += 0.30 * len(adds)
+                    value -= 0.10 * overlap
+                    value -= 0.10 * redundancy_penalty
+
+                    if not adds and len(selected_local) >= 1:
+                        value -= 0.30
+
+                    if value > best_value:
+                        best_value = value
+                        best_idx = idx
+
+                if best_idx is None:
+                    break
+
+                chosen = candidates.pop(best_idx)
+                adds = set(chosen.reachable_chs) - covered
+
                 if not adds and len(selected_local) >= 1:
                     continue
-                selected_local.append(cand)
-                covered.update(cand.reachable_chs)
-                if covered >= (set(chs) - {ch}):
-                    break
-                if len(selected_local) >= 3:
+
+                selected_local.append(chosen)
+                for x in chosen.reachable_chs:
+                    used_target_count[x] = used_target_count.get(x, 0) + 1
+                covered.update(chosen.reachable_chs)
+
+                if uncovered <= covered:
                     break
 
             for cand in selected_local:
                 forwarders.add(cand.node_id)
+
+            # If CH is disconnected from all other CHs, try hard to keep at least one bridge.
+            if not direct_ch_reach.get(ch) and not selected_local and candidates:
+                fallback = max(candidates, key=lambda c: c.score)
+                forwarders.add(fallback.node_id)
 
         for node in alive.values():
             node.is_forwarder = node.node_id in forwarders and node.role != Role.CH
@@ -469,7 +614,6 @@ class WCAClusterer:
             else:
                 speed_term = min(1.0, node.speed_m_s / 50.0)
 
-            # lower is better in WCA-like score
             node.utility = (
                 0.40 * (1.0 - min(1.0, deg / max(1, len(alive) - 1)))
                 + 0.25 * degree_diff
@@ -477,7 +621,6 @@ class WCAClusterer:
                 + 0.15 * speed_term
             )
 
-        # greedy repeated CH choice
         unassigned = set(alive.keys())
         clusters: Dict[int, List[int]] = {}
 
@@ -500,7 +643,6 @@ class WCAClusterer:
 
             unassigned -= members_to_remove
 
-        # weak / sparse forwarders
         forwarders: Set[int] = set()
         for ch, members in clusters.items():
             best_m = None
@@ -539,7 +681,6 @@ class DCAClusterer:
         if not alive:
             return ClusterResult({}, set())
 
-        # six-factor style scoring, but static
         for node in alive.values():
             deg = len(_alive_neighbors(node, alive))
             deg_norm = min(1.0, deg / max(1, len(alive) - 1))
@@ -592,7 +733,6 @@ class DCAClusterer:
                     best = ch
 
             if best is None:
-                # isolated fallback
                 node.set_role(Role.CH)
                 node.cluster_head = i
                 clusters[i] = [i]

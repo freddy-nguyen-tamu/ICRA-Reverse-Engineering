@@ -39,8 +39,6 @@ def mobility_stability_factor(node: Node, nodes: Dict[int, Node]) -> float:
     p50 = sims_sorted[len(sims_sorted) // 2]
     worst = sims_sorted[0]
 
-    # Stronger pessimistic shaping than before:
-    # paper favors stable local motion, not average-only motion.
     score = 0.45 * mean(sims) + 0.30 * p50 + 0.15 * p25 + 0.10 * worst
     return clamp(score, 0.0, 1.0)
 
@@ -63,7 +61,6 @@ def link_stability_factor(
     p50 = stable_sorted[len(stable_sorted) // 2]
     worst = stable_sorted[0]
 
-    # Penalize brittle neighborhoods harder.
     score = 0.40 * mean(stable) + 0.25 * p50 + 0.20 * p25 + 0.15 * worst
     return clamp(score, 0.0, 1.0)
 
@@ -82,9 +79,38 @@ def degree_centrality_factor(node: Node, nodes: Dict[int, Node]) -> float:
     global_deg = deg / max(1, len(alive_nodes) - 1)
     local_deg = deg / max(1, max_deg)
 
-    # Slightly less aggressive than before; degree matters,
-    # but should not dominate energy + stability.
     return clamp(0.40 * global_deg + 0.60 * local_deg, 0.0, 1.0)
+
+
+def connectivity_support_factor(
+    node: Node,
+    nodes: Dict[int, Node],
+    comm_radius_m: float,
+    lht_cap_s: float,
+) -> float:
+    nbrs = _valid_neighbor_ids(node, nodes)
+    if not nbrs:
+        return 0.0
+
+    supports: List[float] = []
+    for j in nbrs:
+        other = nodes[j]
+        if other.e_j <= 0:
+            continue
+        lht = link_holding_time_s(node, other, comm_radius_m)
+        lht_norm = min(lht, lht_cap_s) / max(1e-9, lht_cap_s)
+        energy = clamp(other.e_j / max(1e-9, other.e0_j), 0.0, 1.0)
+        supports.append(0.65 * lht_norm + 0.35 * energy)
+
+    if not supports:
+        return 0.0
+
+    supports.sort(reverse=True)
+    best = supports[0]
+    second = supports[1] if len(supports) > 1 else supports[0]
+    mean_support = mean(supports)
+
+    return clamp(0.30 * best + 0.25 * second + 0.45 * mean_support, 0.0, 1.0)
 
 
 @dataclass(frozen=True)
@@ -103,16 +129,13 @@ def compute_factors(
     lht_cap_s: float,
     v_max: float,
 ) -> UtilityFactors:
-    # Eq. (7): residual energy ratio
     s1 = clamp(node.e_j / max(1e-9, node.e0_j), 0.0, 1.0)
 
-    # Eq. (8): degree centrality
-    s2 = degree_centrality_factor(node, nodes)
+    base_degree = degree_centrality_factor(node, nodes)
+    connectivity = connectivity_support_factor(node, nodes, comm_radius_m, lht_cap_s)
+    s2 = clamp(0.78 * base_degree + 0.22 * connectivity, 0.0, 1.0)
 
-    # Paper text wants velocity similarity to support stability.
     s3 = mobility_stability_factor(node, nodes)
-
-    # Eq. (14): average link holding time (normalized)
     s4 = link_stability_factor(node, nodes, comm_radius_m, lht_cap_s)
 
     return UtilityFactors(s1, s2, s3, s4)

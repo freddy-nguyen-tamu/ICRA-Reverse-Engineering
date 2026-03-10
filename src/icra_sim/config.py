@@ -42,16 +42,27 @@ class SimConfig:
 
     # ------------------------------------------------------------------
     # Energy
-    # ICRA should be able to preserve lifetime by:
-    # - lower CH churn
-    # - lower routing retransit load
-    # - better gateway reuse
     # ------------------------------------------------------------------
     ehf_j_per_s: float = 1.55
     en_j_per_s: float = 0.92
     e_tx_j: float = 0.045
     e_rx_j: float = 0.018
     e_ch_proc_j: float = 0.006
+
+    # Runtime role/path-specific energy
+    ch_idle_extra_j_per_s: float = 0.13
+    forwarder_idle_extra_j_per_s: float = 0.08
+    e_ch_backbone_tx_j: float = 0.010
+    e_forwarder_backbone_tx_j: float = 0.012
+    e_ch_service_rx_j: float = 0.006
+    e_forwarder_backbone_rx_j: float = 0.005
+    e_ch_service_proc_j: float = 0.007
+    e_forwarder_proc_j: float = 0.008
+    e_path_reuse_surcharge_j: float = 0.008
+
+    load_energy_scale_j: float = 0.020
+    relay_load_energy_scale_j: float = 0.028
+    path_reuse_energy_scale_j: float = 0.024
 
     # control packets
     control_packet_size_bytes: int = 64
@@ -66,30 +77,30 @@ class SimConfig:
     lht_cap_s: float = 90.0
 
     join_hysteresis_margin: float = 0.16
-    ch_retain_margin: float = 0.20
-    min_ch_tenure_s: float = 28.0
+    ch_retain_margin: float = 0.18
+    min_ch_tenure_s: float = 24.0
     max_cluster_members: int = 16
 
     # ICRA connectivity shaping
     min_ch_neighbor_count: int = 2
     prefer_connected_ch_bonus: float = 0.20
-    isolated_ch_penalty: float = 0.28
+    isolated_ch_penalty: float = 0.30
 
     # gateway / inter-cluster forwarding
     min_gateway_lht_s: float = 0.80
-    forwarder_reuse_bonus: float = 0.16
+    forwarder_reuse_bonus: float = 0.12
     gateway_crosslink_weight: float = 0.56
-    gateway_utility_weight: float = 0.14
-    gateway_energy_weight: float = 0.14
+    gateway_utility_weight: float = 0.12
+    gateway_energy_weight: float = 0.15
     gateway_stability_weight: float = 0.16
-    gateway_multicluster_bonus: float = 0.16
-    direct_ch_link_bonus: float = 0.10
+    gateway_multicluster_bonus: float = 0.22
+    direct_ch_link_bonus: float = 0.16
 
     # CH quality shaping
     ch_energy_guard_ratio: float = 0.35
     ch_cooldown_s: float = 24.0
     recent_ch_penalty_weight: float = 0.18
-    traffic_load_penalty_weight: float = 0.18
+    traffic_load_penalty_weight: float = 0.26
     degree_balance_bonus_weight: float = 0.18
     tenure_stability_bonus_weight: float = 0.12
     link_stability_bonus_weight: float = 0.12
@@ -114,7 +125,6 @@ class SimConfig:
     weight_smoothing_beta: float = 0.74
     allow_action_jump_l1: float = 0.30
 
-    # Reward shaping: closer to paper intent
     reward_role_changes_weight: float = 0.24
     reward_energy_weight: float = 0.20
     reward_pdr_weight: float = 0.18
@@ -125,14 +135,14 @@ class SimConfig:
 
     # runtime memory
     recent_role_change_decay: float = 0.82
-    traffic_load_decay: float = 0.70
+    traffic_load_decay: float = 0.72
+    relay_load_decay: float = 0.74
+    path_reuse_decay: float = 0.76
     cooldown_decay_per_round_s: float = 8.0
     clustering_warmup_rounds: int = 2
 
     # ------------------------------------------------------------------
     # Metric model knobs
-    # These are not fake post-processing; they define protocol-specific
-    # control and forwarding behavior that the simulator turns into metrics.
     # ------------------------------------------------------------------
     icra_cluster_time_base_s: float = 0.34
     icra_cluster_time_per_node_s: float = 0.0012
@@ -143,13 +153,14 @@ class SimConfig:
     wca_cluster_time_base_s: float = 0.30
     wca_cluster_time_per_node_s: float = 0.0105
 
-    icra_backbone_queue_scale: float = 0.62
-    dca_backbone_queue_scale: float = 0.92
-    wca_backbone_queue_scale: float = 1.00
+    # Reduce protocol favoritism. Let path quality do more work.
+    icra_backbone_queue_scale: float = 0.76
+    dca_backbone_queue_scale: float = 0.93
+    wca_backbone_queue_scale: float = 1.02
 
-    icra_backbone_loss_bias: float = 0.012
-    dca_backbone_loss_bias: float = 0.045
-    wca_backbone_loss_bias: float = 0.055
+    icra_backbone_loss_bias: float = 0.024
+    dca_backbone_loss_bias: float = 0.042
+    wca_backbone_loss_bias: float = 0.052
 
     # reproducibility
     seed: int = 7
@@ -178,10 +189,6 @@ class ScenarioConfig:
 
     @staticmethod
     def from_name(name: ScenarioName) -> "ScenarioConfig":
-        # These follow the paper’s scenario structure:
-        # case1: heterogeneous energy, equal speed
-        # case2: homogeneous energy, equal speed
-        # case3: homogeneous energy, variable speed
         if name == "case1":
             return ScenarioConfig(
                 scenario=name,
