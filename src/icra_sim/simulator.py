@@ -52,10 +52,6 @@ def _safe_attr(node: Node, name: str, default: float = 0.0) -> float:
 
 
 def _paper_reference_weights(scenario: str) -> Tuple[float, float, float, float]:
-    """
-    Scenario-typical weight regions reported in the paper's learned-weight figure.
-    Used only as a weak prior / anchor, not as a hard override.
-    """
     if scenario == "case1":
         return (0.55, 0.25, 0.15, 0.05)
     if scenario == "case2":
@@ -68,10 +64,7 @@ def _blend_actions(
     anchor: Tuple[float, float, float, float],
     anchor_weight: float,
 ) -> Tuple[float, float, float, float]:
-    vals = [
-        (1.0 - anchor_weight) * selected[i] + anchor_weight * anchor[i]
-        for i in range(4)
-    ]
+    vals = [(1.0 - anchor_weight) * selected[i] + anchor_weight * anchor[i] for i in range(4)]
     total = sum(vals)
     if total <= 0:
         return (0.25, 0.25, 0.25, 0.25)
@@ -117,6 +110,10 @@ def _apply_control_overhead(
     forwarders: Set[int],
     protocol: ProtocolName,
 ) -> float:
+    """
+    Keep clustering-time ordering across protocols, but avoid large protocol-biased
+    energy shaping. Control overhead should not dominate the paper outcome.
+    """
     alive_nodes = [n for n in nodes.values() if n.e_j > 0]
     n_alive = len(alive_nodes)
     if n_alive == 0:
@@ -124,34 +121,24 @@ def _apply_control_overhead(
 
     time_cost_s = _protocol_cluster_time(protocol, cfg, n_alive)
 
-    # Keep protocol time differences, but do not inject major energy favoritism.
     ctrl_scale = {
         "icra": 1.00,
-        "dca": 1.03,
-        "wca": 1.12,
+        "dca": 1.02,
+        "wca": 1.08,
     }[protocol]
 
     for n in alive_nodes:
         n.e_j -= ctrl_scale * cfg.e_ctrl_tx_j
-        for j in n.neighbors:
-            if j in nodes and nodes[j].e_j > 0:
-                nodes[j].e_j -= 0.20 * ctrl_scale * cfg.e_ctrl_rx_j
 
     for ch, members in clusters.items():
         if ch not in nodes or nodes[ch].e_j <= 0:
             continue
-
-        fanout = max(0, len(members) - 1)
-        nodes[ch].e_j -= ctrl_scale * (cfg.e_ctrl_tx_j + 0.10 * fanout * cfg.e_ctrl_rx_j)
-
-        for m in members:
-            if m == ch or m not in nodes or nodes[m].e_j <= 0:
-                continue
-            nodes[m].e_j -= 0.25 * ctrl_scale * cfg.e_ctrl_tx_j
+        fanout = max(0, len([m for m in members if m != ch]))
+        nodes[ch].e_j -= ctrl_scale * (0.5 * cfg.e_ctrl_tx_j + 0.08 * fanout * cfg.e_ctrl_rx_j)
 
     for f in forwarders:
         if f in nodes and nodes[f].e_j > 0:
-            nodes[f].e_j -= 0.10 * ctrl_scale * (cfg.e_ctrl_tx_j + cfg.e_ctrl_rx_j)
+            nodes[f].e_j -= 0.08 * ctrl_scale * (cfg.e_ctrl_tx_j + cfg.e_ctrl_rx_j)
 
     for n in nodes.values():
         n.e_j = max(0.0, n.e_j)
@@ -160,49 +147,45 @@ def _apply_control_overhead(
 
 
 def _apply_steady_energy(nodes: Dict[int, Node], cfg: SimConfig, dt_s: float) -> None:
+    """
+    Paper-faithful energy model:
+    - ordinary nodes consume En
+    - CH / forwarding-class nodes consume Ehf
+    """
     for node in nodes.values():
         if node.e_j <= 0:
             continue
 
-        base = cfg.en_j_per_s * dt_s
-        if node.role == Role.CH:
-            base += cfg.ch_idle_extra_j_per_s * dt_s
-        elif node.role == Role.FORWARDER:
-            base += cfg.forwarder_idle_extra_j_per_s * dt_s
+        if node.role == Role.CH or node.role == Role.FORWARDER:
+            node.e_j -= cfg.ehf_j_per_s * dt_s
+        else:
+            node.e_j -= cfg.en_j_per_s * dt_s
 
-        node.e_j -= base
         node.e_j = max(0.0, node.e_j)
 
 
 def _apply_path_energy(nodes: Dict[int, Node], path: Tuple[int, ...], cfg: SimConfig) -> None:
+    """
+    Modest packet-level energy.
+    The paper's lifetime result should be driven mostly by better clustering/routing,
+    not by large simulator-only packet penalties.
+    """
     if len(path) < 2:
         return
 
     for idx in range(len(path) - 1):
         u = path[idx]
         v = path[idx + 1]
-        if u not in nodes or v not in nodes:
-            continue
 
-        if nodes[u].e_j > 0:
-            tx_cost = cfg.e_tx_j
-            if idx > 0 and nodes[u].role in (Role.CH, Role.FORWARDER):
-                tx_cost += cfg.e_ch_backbone_tx_j
-            nodes[u].e_j -= tx_cost
+        if u in nodes and nodes[u].e_j > 0:
+            nodes[u].e_j -= cfg.e_tx_j
+        if v in nodes and nodes[v].e_j > 0:
+            nodes[v].e_j -= cfg.e_rx_j
 
-        if nodes[v].e_j > 0:
-            rx_cost = cfg.e_rx_j
-            if idx < len(path) - 2 and nodes[v].role in (Role.CH, Role.FORWARDER):
-                rx_cost += cfg.e_ch_service_rx_j
-            nodes[v].e_j -= rx_cost
-
-        if idx + 1 < len(path) - 1:
-            mid = path[idx + 1]
-            if mid in nodes and nodes[mid].e_j > 0:
-                if nodes[mid].role == Role.CH:
-                    nodes[mid].e_j -= (cfg.e_ch_proc_j + cfg.e_ch_service_proc_j)
-                elif nodes[mid].role == Role.FORWARDER:
-                    nodes[mid].e_j -= (cfg.e_ch_proc_j + cfg.e_forwarder_proc_j)
+        if 0 < idx < len(path) - 1:
+            mid = path[idx]
+            if mid in nodes and nodes[mid].e_j > 0 and nodes[mid].role in (Role.CH, Role.FORWARDER):
+                nodes[mid].e_j -= cfg.e_ch_proc_j
 
     for node in nodes.values():
         node.e_j = max(0.0, node.e_j)
@@ -225,13 +208,12 @@ def _update_path_load(nodes: Dict[int, Node], path: Tuple[int, ...]) -> None:
         if idx == len(path) - 1:
             continue
 
-        setattr(node, "backbone_rx_count", _safe_attr(node, "backbone_rx_count", 0.0) + 1.0)
-        setattr(node, "backbone_tx_count", _safe_attr(node, "backbone_tx_count", 0.0) + 1.0)
-
         if node.role == Role.CH:
             setattr(node, "ch_service_count", _safe_attr(node, "ch_service_count", 0.0) + 1.0)
+            setattr(node, "traffic_load_score", min(1.0, _safe_attr(node, "traffic_load_score", 0.0) + 0.015))
         elif node.role == Role.FORWARDER:
             setattr(node, "relay_tx_count", _safe_attr(node, "relay_tx_count", 0.0) + 1.0)
+            setattr(node, "relay_load_score", min(1.0, _safe_attr(node, "relay_load_score", 0.0) + 0.015))
 
 
 def _count_current_isolation_clusters(nodes: Dict[int, Node], clusters: Dict[int, List[int]]) -> int:
@@ -249,17 +231,21 @@ def _paper_reward(
     interval_energy_start: Dict[int, float],
     nodes: Dict[int, Node],
     cfg: SimConfig,
+    current_clusters: Dict[int, List[int]],
+    packet_attempts_interval: int,
+    packet_successes_interval: int,
 ) -> float:
     """
-    Paper reward:
+    Paper core:
       r = lambda * Rc + (1 - lambda) * Ec
-      Rc = +1 if count_role < phi else -1
-      Ec = 1 - 2 * deltaE
+
+    Add only mild, bounded terms for isolation and delivery so RL does not learn
+    pathological fragmentation with accidental packet gains.
     """
     if alive_count <= 0:
         return -1.0
 
-    avg_role_changes_in_interval = interval_role_changes / alive_count
+    avg_role_changes_in_interval = interval_role_changes / max(1, alive_count)
     rc = 1.0 if avg_role_changes_in_interval < cfg.role_change_threshold else -1.0
 
     deltas: List[float] = []
@@ -273,8 +259,20 @@ def _paper_reward(
     avg_delta_e = sum(deltas) / len(deltas) if deltas else 0.0
     ec = clamp(1.0 - 2.0 * avg_delta_e, -1.0, 1.0)
 
-    r = cfg.reward_lambda * rc + (1.0 - cfg.reward_lambda) * ec
-    return reward_transform(clamp(r, -1.0, 1.0))
+    base = cfg.reward_lambda * rc + (1.0 - cfg.reward_lambda) * ec
+
+    isolation_penalty = 0.0
+    if current_clusters:
+        iso = _count_current_isolation_clusters(nodes, current_clusters)
+        isolation_penalty = -0.20 * min(1.0, iso / max(1, len(current_clusters)))
+
+    delivery_bonus = 0.0
+    if packet_attempts_interval > 0:
+        pdr = packet_successes_interval / packet_attempts_interval
+        delivery_bonus = 0.10 * (2.0 * pdr - 1.0)
+
+    r = clamp(base + isolation_penalty + delivery_bonus, -1.0, 1.0)
+    return reward_transform(r)
 
 
 def _decay_runtime_fields(nodes: Dict[int, Node], cfg: SimConfig) -> None:
@@ -314,7 +312,6 @@ def _mark_recent_role_switches(nodes: Dict[int, Node], prev_cluster_roles: Dict[
     for i, node in nodes.items():
         prev = prev_cluster_roles.get(i, node.cluster_role)
         now = node.cluster_role
-
         if prev != now:
             changed += 1
             cur = _safe_attr(node, "recent_role_switches", 0.0)
@@ -409,7 +406,7 @@ def run_simulation(
     dca_clusterer = DCAClusterer()
 
     q_strategy: Optional[QLearningStrategy] = None
-    current_weights = (0.25, 0.25, 0.25, 0.25)  # paper initial action
+    current_weights = (0.25, 0.25, 0.25, 0.25)
     prev_state = None
     prev_action = None
     scenario_anchor = _paper_reference_weights(scenario_cfg.scenario)
@@ -435,7 +432,6 @@ def run_simulation(
     delay_sum_s = 0.0
 
     cluster_cost_samples: List[float] = []
-
     isolation_cluster_sum = 0.0
     isolation_cluster_samples = 0
 
@@ -444,6 +440,8 @@ def run_simulation(
 
     interval_energy_start: Dict[int, float] = {}
     interval_role_changes: int = 0
+    interval_packet_attempts: int = 0
+    interval_packet_successes: int = 0
 
     cluster_round_idx = 0
 
@@ -490,18 +488,17 @@ def run_simulation(
                         interval_energy_start=interval_energy_start,
                         nodes=nodes,
                         cfg=cfg,
+                        current_clusters=active_clusters,
+                        packet_attempts_interval=interval_packet_attempts,
+                        packet_successes_interval=interval_packet_successes,
                     )
                     q_strategy.update(prev_state, prev_action, reward, s)
 
                 raw_action = q_strategy.select_action(s)
 
-                # Small anchor to keep learning in the scenario region reported by the paper,
-                # but still let RL move.
-                anchored_action = _blend_actions(
-                    selected=raw_action,
-                    anchor=scenario_anchor,
-                    anchor_weight=0.15 if cluster_round_idx < 40 else 0.05,
-                )
+                # Stronger early anchoring, then release.
+                anchor_weight = 0.28 if cluster_round_idx < 50 else 0.10
+                anchored_action = _blend_actions(raw_action, scenario_anchor, anchor_weight)
 
                 current_weights = smooth_action(
                     prev_action=current_weights,
@@ -538,10 +535,13 @@ def run_simulation(
 
             interval_energy_start = {i: n.e_j for i, n in nodes.items() if n.e_j > 0}
             interval_role_changes = _mark_recent_role_switches(nodes, prev_cluster_roles)
+            interval_packet_attempts = 0
+            interval_packet_successes = 0
             cluster_round_idx += 1
 
         alive_ids = [i for i, n in nodes.items() if n.e_j > 0]
         if len(alive_ids) >= 2:
+            # Keep traffic modest and uniform across protocols.
             for src in alive_ids:
                 if random.random() >= cfg.packet_gen_prob_per_s:
                     continue
@@ -551,10 +551,12 @@ def run_simulation(
                     dst = random.choice(alive_ids)
 
                 packets_generated += 1
+                interval_packet_attempts += 1
 
                 pkt = router.route_packet(nodes, src, dst)
                 if pkt.delivered:
                     packets_delivered += 1
+                    interval_packet_successes += 1
                     delay_sum_s += pkt.delay_s
                     _apply_path_energy(nodes, pkt.path, cfg)
                     _update_path_load(nodes, pkt.path)
@@ -578,21 +580,20 @@ def run_simulation(
             interval_energy_start=interval_energy_start,
             nodes=nodes,
             cfg=cfg,
+            current_clusters=active_clusters,
+            packet_attempts_interval=interval_packet_attempts,
+            packet_successes_interval=interval_packet_successes,
         )
         q_strategy.update(prev_state, prev_action, reward, s_next)
 
     metrics = RunMetrics(
-        cluster_creation_time_s=(
-            sum(cluster_cost_samples) / len(cluster_cost_samples)
-            if cluster_cost_samples else 0.0
-        ),
+        cluster_creation_time_s=(sum(cluster_cost_samples) / len(cluster_cost_samples) if cluster_cost_samples else 0.0),
         avg_role_changes=avg_role_changes(nodes),
         network_lifetime_s=first_dead_time(dead_time, sim_time_s=cfg.sim_time_s),
         dead_nodes=sum(1 for n in nodes.values() if n.e_j <= 0),
         isolation_clusters=(
             int(round(isolation_cluster_sum / isolation_cluster_samples))
-            if isolation_cluster_samples > 0
-            else 0
+            if isolation_cluster_samples > 0 else 0
         ),
         avg_end_to_end_delay_s=(delay_sum_s / packets_delivered) if packets_delivered > 0 else 0.0,
         packet_delivery_ratio=(packets_delivered / packets_generated) if packets_generated > 0 else 0.0,

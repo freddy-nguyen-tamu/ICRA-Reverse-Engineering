@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import heapq
+import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-from ..utils import euclidean
 from ..node import Node, Role
+from ..utils import euclidean
 
 
 def _alive_neighbors(node: Node, nodes: Dict[int, Node]) -> List[int]:
@@ -22,15 +23,17 @@ class PacketResult:
 
 class Router:
     """
-    Paper-faithful router:
-    - member sends to its CH directly
-    - if sender/receiver are in same cluster, CH delivers directly
-    - otherwise CH forwards toward the destination through:
-        * neighboring CHs, or
-        * forwarding nodes in its cluster
-    - forwarding node forwards to the closest eligible next hop among:
-        * its own CH
-        * neighbors in other clusters
+    Paper-faithful routing model:
+    - member -> own CH directly
+    - if source and destination are in the same cluster, CH delivers directly
+    - otherwise packets traverse the inter-cluster backbone
+    - backbone is built from:
+        * CH <-> neighboring CH
+        * CH <-> forwarding nodes in its own cluster
+        * FORWARDER <-> own CH
+        * FORWARDER <-> nodes from other clusters that are within range
+    - path choice uses shortest-hop backbone routing with a mild geographic tie-break
+    - delivery probability depends on hop count and link quality, not protocol favoritism
     """
 
     def __init__(
@@ -44,14 +47,14 @@ class Router:
         max_hops: int = 30,
     ):
         self.comm_radius_m = comm_radius_m
-        self.data_rate_bps = data_rate_kbps * 1000
+        self.data_rate_bps = max(1, data_rate_kbps * 1000)
         self.packet_size_bits = packet_size_bytes * 8
         self.per_hop_processing_delay_s = per_hop_processing_delay_s
         self.mac_contention_delay_s = mac_contention_delay_s
         self.queueing_delay_s = queueing_delay_s
         self.max_hops = max_hops
 
-        # Retained only for API compatibility with simulator.
+        # kept only for API compatibility
         self.backbone_queue_scale: float = 1.0
         self.backbone_loss_bias: float = 0.0
 
@@ -60,21 +63,19 @@ class Router:
         self.backbone_loss_bias = backbone_loss_bias
 
     def _tx_delay(self) -> float:
-        return self.packet_size_bits / max(1.0, self.data_rate_bps)
+        return self.packet_size_bits / self.data_rate_bps
 
     def _hop_delay(self, backbone: bool) -> float:
         delay = self._tx_delay() + self.per_hop_processing_delay_s + self.mac_contention_delay_s
         if backbone:
-            delay += self.queueing_delay_s
+            delay += self.queueing_delay_s * max(0.7, self.backbone_queue_scale)
         return delay
 
-    def _same_cluster(self, nodes: Dict[int, Node], a: int, b: int) -> bool:
-        if a not in nodes or b not in nodes:
-            return False
-
-        a_ch = a if nodes[a].role == Role.CH else nodes[a].cluster_head
-        b_ch = b if nodes[b].role == Role.CH else nodes[b].cluster_head
-        return a_ch is not None and a_ch == b_ch
+    def _cluster_id(self, nodes: Dict[int, Node], node_id: int) -> Optional[int]:
+        if node_id not in nodes or nodes[node_id].e_j <= 0:
+            return None
+        node = nodes[node_id]
+        return node_id if node.role == Role.CH else node.cluster_head
 
     def _access_point(self, nodes: Dict[int, Node], node_id: int) -> Optional[int]:
         if node_id not in nodes or nodes[node_id].e_j <= 0:
@@ -89,10 +90,25 @@ class Router:
 
         return None
 
-    def _cluster_id(self, nodes: Dict[int, Node], node_id: int) -> Optional[int]:
-        if node_id not in nodes or nodes[node_id].e_j <= 0:
-            return None
-        return node_id if nodes[node_id].role == Role.CH else nodes[node_id].cluster_head
+    def _same_cluster(self, nodes: Dict[int, Node], a: int, b: int) -> bool:
+        ca = self._cluster_id(nodes, a)
+        cb = self._cluster_id(nodes, b)
+        return ca is not None and ca == cb
+
+    def _link_distance(self, nodes: Dict[int, Node], a: int, b: int) -> float:
+        if a not in nodes or b not in nodes:
+            return float("inf")
+        return euclidean(nodes[a].pos(), nodes[b].pos())
+
+    def _link_quality(self, nodes: Dict[int, Node], a: int, b: int) -> float:
+        """
+        Geometry-only quality in [0, 1].
+        No protocol-specific shaping.
+        """
+        d = self._link_distance(nodes, a, b)
+        if d > self.comm_radius_m:
+            return 0.0
+        return max(0.0, min(1.0, 1.0 - (d / max(1.0, self.comm_radius_m)) ** 1.35))
 
     def _eligible_backbone_neighbors(self, nodes: Dict[int, Node], node_id: int) -> List[int]:
         if node_id not in nodes or nodes[node_id].e_j <= 0:
@@ -100,60 +116,31 @@ class Router:
 
         node = nodes[node_id]
         nbrs = _alive_neighbors(node, nodes)
+        own_cluster = self._cluster_id(nodes, node_id)
+
+        eligible: Set[int] = set()
 
         if node.role == Role.CH:
-            own_cluster = node_id
-            eligible: List[int] = []
             for j in nbrs:
                 other = nodes[j]
                 if other.role == Role.CH:
-                    eligible.append(j)
-                elif other.role == Role.FORWARDER and other.cluster_head == own_cluster:
-                    eligible.append(j)
-            return eligible
-
-        if node.role == Role.FORWARDER:
-            own_cluster = node.cluster_head
-            eligible = []
-            if own_cluster is not None and own_cluster in nodes and own_cluster in nbrs:
-                eligible.append(own_cluster)
-
+                    eligible.add(j)
+                elif other.role == Role.FORWARDER and other.cluster_head == node_id:
+                    eligible.add(j)
+        elif node.role == Role.FORWARDER:
+            if own_cluster is not None and own_cluster in nbrs and nodes[own_cluster].e_j > 0:
+                eligible.add(own_cluster)
             for j in nbrs:
                 other_cluster = self._cluster_id(nodes, j)
                 if other_cluster is not None and other_cluster != own_cluster:
-                    eligible.append(j)
-            return sorted(set(eligible))
+                    eligible.add(j)
 
-        return []
+        return sorted(eligible)
 
-    def _distance_to_dst(self, nodes: Dict[int, Node], node_id: int, dst: int) -> float:
-        if node_id not in nodes or dst not in nodes:
-            return float("inf")
-        return euclidean(nodes[node_id].pos(), nodes[dst].pos())
-
-    def _backbone_next_hop(self, nodes: Dict[int, Node], cur: int, dst: int, visited: set[int]) -> Optional[int]:
-        candidates = [j for j in self._eligible_backbone_neighbors(nodes, cur) if j not in visited]
-        if not candidates:
-            return None
-
-        candidates.sort(
-            key=lambda j: (
-                self._distance_to_dst(nodes, j, dst),
-                0 if nodes[j].role == Role.CH else 1,
-                -nodes[j].e_j,
-                j,
-            )
-        )
-        return candidates[0]
-
-    def _shortest_backbone_path(self, nodes: Dict[int, Node], src_ap: int, dst_ap: int) -> Optional[Tuple[int, ...]]:
+    def _backbone_path(self, nodes: Dict[int, Node], src_ap: int, dst_ap: int, dst: int) -> Optional[Tuple[int, ...]]:
         """
-        Used by the simulator's connectivity/isolation accounting.
-        Graph is the paper-style backbone:
-        CH <-> neighboring CH
-        CH <-> forwarding nodes in its cluster
-        FORWARDER <-> its CH
-        FORWARDER <-> neighbors in other clusters
+        Shortest-hop path with mild geographic tie-break.
+        This is closer to the paper than the previous hand-shaped greedy penalties.
         """
         if src_ap not in nodes or dst_ap not in nodes:
             return None
@@ -162,35 +149,58 @@ class Router:
         if src_ap == dst_ap:
             return (src_ap,)
 
-        pq: List[Tuple[int, int, Tuple[int, ...]]] = [(0, src_ap, (src_ap,))]
-        best_cost: Dict[int, int] = {src_ap: 0}
+        pq: List[Tuple[int, float, int, Tuple[int, ...]]] = []
+        heapq.heappush(pq, (0, self._link_distance(nodes, src_ap, dst), src_ap, (src_ap,)))
+        best: Dict[int, Tuple[int, float]] = {src_ap: (0, self._link_distance(nodes, src_ap, dst))}
 
         while pq:
-            cost, cur, path = heapq.heappop(pq)
+            hops, geo, cur, path = heapq.heappop(pq)
             if cur == dst_ap:
                 return path
-            if cost > best_cost.get(cur, 10**9):
+            if hops > self.max_hops:
+                continue
+
+            best_hops, best_geo = best.get(cur, (10**9, float("inf")))
+            if hops > best_hops or (hops == best_hops and geo > best_geo + 1e-12):
                 continue
 
             for nxt in self._eligible_backbone_neighbors(nodes, cur):
-                nxt_cost = cost + 1
-                if nxt_cost < best_cost.get(nxt, 10**9):
-                    best_cost[nxt] = nxt_cost
-                    heapq.heappush(pq, (nxt_cost, nxt, path + (nxt,)))
+                nxt_hops = hops + 1
+                nxt_geo = self._link_distance(nodes, nxt, dst)
+                prev = best.get(nxt)
+                if prev is None or nxt_hops < prev[0] or (nxt_hops == prev[0] and nxt_geo < prev[1]):
+                    best[nxt] = (nxt_hops, nxt_geo)
+                    heapq.heappush(pq, (nxt_hops, nxt_geo, nxt, path + (nxt,)))
 
         return None
 
-    def _delivery_success_prob(self, path: Tuple[int, ...]) -> float:
+    def _path_success_probability(self, nodes: Dict[int, Node], path: Tuple[int, ...]) -> float:
         """
-        Keep packet success moderate and realistic:
-        longer paths reduce success, but not via protocol favoritism.
+        Conservative delivery model:
+        - each hop contributes a moderate success factor
+        - weaker/longer links reduce success
+        - long multi-hop routes naturally lose reliability
         """
         if len(path) <= 1:
             return 1.0
+
+        prob = 1.0
         hops = len(path) - 1
-        prob = 0.97
-        for _ in range(hops):
-            prob *= 0.965
+
+        for i in range(hops):
+            a = path[i]
+            b = path[i + 1]
+            q = self._link_quality(nodes, a, b)
+
+            # Keep per-hop success realistic but not punitive.
+            hop_success = 0.90 + 0.08 * q
+            prob *= max(0.0, min(1.0, hop_success))
+
+        # Small extra decay with route length.
+        if hops > 1:
+            prob *= 0.985 ** (hops - 1)
+
+        # No protocol bias.
         return max(0.0, min(1.0, prob))
 
     def route_packet(self, nodes: Dict[int, Node], src: int, dst: int) -> PacketResult:
@@ -210,7 +220,7 @@ class Router:
         hops = 0
         delay_s = 0.0
 
-        # Step 1: member -> CH directly
+        # member -> CH
         if src != src_ap:
             if src_ap not in _alive_neighbors(nodes[src], nodes):
                 return PacketResult(False, hops, delay_s, tuple(path))
@@ -218,7 +228,7 @@ class Router:
             hops += 1
             delay_s += self._hop_delay(backbone=False)
 
-        # Same cluster: CH can deliver directly to destination member/CH.
+        # same cluster delivery
         if self._same_cluster(nodes, src_ap, dst_ap):
             if dst != path[-1]:
                 if dst not in _alive_neighbors(nodes[path[-1]], nodes):
@@ -227,33 +237,23 @@ class Router:
                 hops += 1
                 delay_s += self._hop_delay(backbone=False)
 
+            full_path = tuple(path)
+            delivered = random.random() < self._path_success_probability(nodes, full_path)
+            return PacketResult(delivered, hops, delay_s, full_path)
+
+        # backbone routing
+        backbone = self._backbone_path(nodes, src_ap, dst_ap, dst)
+        if backbone is None:
+            return PacketResult(False, hops, delay_s, tuple(path))
+
+        for nxt in backbone[1:]:
+            path.append(nxt)
+            hops += 1
+            delay_s += self._hop_delay(backbone=True)
             if hops > self.max_hops:
                 return PacketResult(False, hops, delay_s, tuple(path))
 
-            ok_prob = self._delivery_success_prob(tuple(path))
-            return PacketResult(ok_prob >= 0.78, hops, delay_s, tuple(path))
-
-        # Different clusters: greedily forward across the backbone
-        cur = src_ap
-        visited = {src}
-        if src_ap in path:
-            visited.add(src_ap)
-
-        while cur != dst_ap and hops < self.max_hops:
-            nxt = self._backbone_next_hop(nodes, cur, dst, visited)
-            if nxt is None:
-                return PacketResult(False, hops, delay_s, tuple(path))
-
-            path.append(nxt)
-            visited.add(nxt)
-            hops += 1
-            delay_s += self._hop_delay(backbone=True)
-            cur = nxt
-
-        if cur != dst_ap:
-            return PacketResult(False, hops, delay_s, tuple(path))
-
-        # Final CH -> destination member, if needed
+        # final CH -> destination
         if dst != dst_ap:
             if dst not in _alive_neighbors(nodes[dst_ap], nodes):
                 return PacketResult(False, hops, delay_s, tuple(path))
@@ -264,5 +264,6 @@ class Router:
         if hops > self.max_hops:
             return PacketResult(False, hops, delay_s, tuple(path))
 
-        ok_prob = self._delivery_success_prob(tuple(path))
-        return PacketResult(ok_prob >= 0.78, hops, delay_s, tuple(path))
+        full_path = tuple(path)
+        delivered = random.random() < self._path_success_probability(nodes, full_path)
+        return PacketResult(delivered, hops, delay_s, full_path)
