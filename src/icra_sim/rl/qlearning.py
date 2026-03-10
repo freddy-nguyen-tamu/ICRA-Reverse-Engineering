@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import random
 from collections import Counter
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -16,18 +15,32 @@ def _quantize_tenth(x: float) -> float:
     return round(clamp(round(x * 10.0) / 10.0, 0.0, 1.0), 1)
 
 
-def _entropy_from_values(values: Iterable[float]) -> float:
-    vals = [_quantize_tenth(v) for v in values]
+def _safe_mean(values: Iterable[float], default: float = 0.0) -> float:
+    vals = list(values)
+    return sum(vals) / len(vals) if vals else default
+
+
+def _std(values: Iterable[float]) -> float:
+    vals = list(values)
     if not vals:
         return 0.0
-    c = Counter(vals)
-    total = len(vals)
-    h = 0.0
-    for count in c.values():
-        p = count / total
-        if p > 0:
-            h -= p * math.log(p)
-    return _quantize_tenth(min(1.0, h))
+    mu = sum(vals) / len(vals)
+    var = sum((x - mu) ** 2 for x in vals) / len(vals)
+    return var ** 0.5
+
+
+def _role_mix_score(nodes: List[Node]) -> float:
+    if not nodes:
+        return 0.0
+    counts = Counter(n.role.value for n in nodes)
+    total = len(nodes)
+    probs = [c / total for c in counts.values()]
+    # normalized entropy proxy over present roles
+    if len(probs) <= 1:
+        return 0.0
+    import math
+    h = -sum(p * math.log(p) for p in probs if p > 0)
+    return clamp(h / math.log(3.0), 0.0, 1.0)
 
 
 def network_state(nodes: Dict[int, Node]) -> State:
@@ -35,11 +48,27 @@ def network_state(nodes: Dict[int, Node]) -> State:
     if not alive:
         return (0.0, 0.0, 0.0, 0.0)
 
+    energy_ratios = [n.s1 for n in alive]
+    lhts = [n.s4 for n in alive]
+    vels = [n.s3 for n in alive]
+    recent_switch = [_quantize_tenth(clamp(getattr(n, "recent_role_switches", 0.0), 0.0, 1.0)) for n in alive]
+
+    avg_energy = clamp(_safe_mean(energy_ratios), 0.0, 1.0)
+    energy_balance = clamp(1.0 - min(1.0, 2.5 * _std(energy_ratios)), 0.0, 1.0)
+    topo_stability = clamp(
+        0.55 * (1.0 - _safe_mean(recent_switch, 0.0))
+        + 0.25 * _safe_mean(lhts, 0.0)
+        + 0.20 * _safe_mean(vels, 0.0),
+        0.0,
+        1.0,
+    )
+    role_mix = _role_mix_score(alive)
+
     return (
-        _entropy_from_values(n.s1 for n in alive),
-        _entropy_from_values(n.s2 for n in alive),
-        _entropy_from_values(n.s3 for n in alive),
-        _entropy_from_values(n.s4 for n in alive),
+        _quantize_tenth(avg_energy),
+        _quantize_tenth(energy_balance),
+        _quantize_tenth(topo_stability),
+        _quantize_tenth(role_mix),
     )
 
 
@@ -129,7 +158,7 @@ class QLearningStrategy:
         self.allow_action_jump_l1 = allow_action_jump_l1
 
         self.q: Dict[Tuple[State, Action], float] = {}
-        self.default_action: Action = (0.25, 0.25, 0.25, 0.25)
+        self.default_action: Action = (0.30, 0.15, 0.20, 0.35)
 
         self.last_action: Optional[Action] = None
         self.last_action_rounds: int = 0
@@ -151,10 +180,37 @@ class QLearningStrategy:
             return self.actions
 
         eligible = [
-            a for a in self.actions
+            a
+            for a in self.actions
             if self._action_distance(a, self.last_action) <= self.allow_action_jump_l1 + 1e-12
         ]
         return eligible if eligible else self.actions
+
+    def _prior_score(self, a: Action) -> float:
+        w1, w2, w3, w4 = a
+
+        # Encourage paper-like stability: energy and LHT matter most,
+        # but do not collapse into pure-energy behavior.
+        score = 0.0
+        score += 0.035 * min(w1, 0.40)
+        score += 0.040 * min(w4, 0.40)
+        score += 0.020 * min(w3, 0.30)
+        score += 0.010 * min(w2, 0.25)
+
+        # Penalize degenerate edge-of-simplex policies.
+        if w1 >= 0.55:
+            score -= 0.060
+        if w4 < 0.15:
+            score -= 0.045
+        if w3 < 0.10:
+            score -= 0.030
+        if w2 > 0.35:
+            score -= 0.015
+
+        # Soft preference for balanced "stable-clustering" profiles.
+        score -= 0.025 * abs(w1 - 0.30)
+        score -= 0.020 * abs(w4 - 0.30)
+        return score
 
     def select_action(self, s: State) -> Action:
         if self.last_action is not None and self.last_action_rounds < self.min_action_hold_rounds:
@@ -168,19 +224,13 @@ class QLearningStrategy:
         else:
             scored: List[Tuple[float, Action]] = []
             for a in candidates:
-                q = self.get_q(s, a)
+                q = self.get_q(s, a) + self._prior_score(a)
 
                 if self.last_action is not None and a == self.last_action:
                     q += self.stickiness_bonus
 
-                # slight prior toward practical paper-like choices
-                w1, w2, w3, w4 = a
-                q += 0.02 * w1
-                q += 0.01 * w4
-                q -= 0.01 * max(0.0, w3 - 0.30)
-
                 if a == self.default_action:
-                    q += 0.005
+                    q += 0.010
 
                 scored.append((q, a))
 

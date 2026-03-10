@@ -52,21 +52,21 @@ class SimConfig:
     lht_cap_s: float = 90.0
 
     # retention / hysteresis
-    join_hysteresis_margin: float = 0.12
-    ch_retain_margin: float = 0.16
-    min_ch_tenure_s: float = 20.0
-    max_cluster_members: int = 20
+    join_hysteresis_margin: float = 0.18
+    ch_retain_margin: float = 0.22
+    min_ch_tenure_s: float = 28.0
+    max_cluster_members: int = 16
 
     # gateway layer
-    min_gateway_lht_s: float = 0.45
+    min_gateway_lht_s: float = 0.60
 
     # connectivity-aware CH scoring
     min_ch_neighbor_count: int = 2
-    prefer_connected_ch_bonus: float = 0.16
-    isolated_ch_penalty: float = 0.20
+    prefer_connected_ch_bonus: float = 0.18
+    isolated_ch_penalty: float = 0.24
 
     # forwarder / gateway selection
-    forwarder_reuse_bonus: float = 0.09
+    forwarder_reuse_bonus: float = 0.10
     gateway_crosslink_weight: float = 0.58
     gateway_utility_weight: float = 0.14
     gateway_energy_weight: float = 0.14
@@ -74,28 +74,48 @@ class SimConfig:
     gateway_multicluster_bonus: float = 0.12
     direct_ch_link_bonus: float = 0.10
 
+    # CH quality shaping
+    ch_energy_guard_ratio: float = 0.35
+    ch_cooldown_s: float = 24.0
+    recent_ch_penalty_weight: float = 0.18
+    traffic_load_penalty_weight: float = 0.18
+    degree_balance_bonus_weight: float = 0.16
+    tenure_stability_bonus_weight: float = 0.10
+    link_stability_bonus_weight: float = 0.10
+    velocity_stability_bonus_weight: float = 0.08
+    local_degree_target: float = 0.58
+    local_degree_tolerance: float = 0.28
+
     # RL
     reward_lambda: float = 0.35
     role_change_threshold: int = 2
-    q_alpha: float = 0.22
-    q_gamma: float = 0.35
-    q_epsilon: float = 0.05
-    q_epsilon_min: float = 0.005
-    q_epsilon_decay: float = 0.998
+    q_alpha: float = 0.18
+    q_gamma: float = 0.55
+    q_epsilon: float = 0.08
+    q_epsilon_min: float = 0.010
+    q_epsilon_decay: float = 0.995
     q_step: float = 0.05
 
     # RL stability controls
-    action_stickiness_bonus: float = 0.12
-    min_action_hold_rounds: int = 8
-    weight_smoothing_beta: float = 0.88
-    allow_action_jump_l1: float = 0.20
+    action_stickiness_bonus: float = 0.16
+    min_action_hold_rounds: int = 5
+    weight_smoothing_beta: float = 0.72
+    allow_action_jump_l1: float = 0.30
 
     # reward weights for paper-like behavior
-    reward_role_changes_weight: float = 0.26
-    reward_energy_weight: float = 0.24
-    reward_pdr_weight: float = 0.24
-    reward_delay_weight: float = 0.18
+    reward_role_changes_weight: float = 0.24
+    reward_energy_weight: float = 0.20
+    reward_pdr_weight: float = 0.18
+    reward_delay_weight: float = 0.12
     reward_isolation_weight: float = 0.08
+    reward_balance_weight: float = 0.10
+    reward_survival_weight: float = 0.08
+
+    # temporal smoothing / role-memory
+    recent_role_change_decay: float = 0.82
+    traffic_load_decay: float = 0.70
+    cooldown_decay_per_round_s: float = 8.0
+    clustering_warmup_rounds: int = 2
 
     # reproducibility
     seed: int = 7

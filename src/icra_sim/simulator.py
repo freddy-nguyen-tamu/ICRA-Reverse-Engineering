@@ -42,10 +42,25 @@ def _sanitize_neighbors(nodes: Dict[int, Node]) -> None:
         node.neighbors = cleaned
 
 
+def _safe_attr(node: Node, name: str, default: float = 0.0) -> float:
+    value = getattr(node, name, default)
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 @dataclass
 class SimulationResult:
     metrics: RunMetrics
     weight_history: List[Tuple[float, float, float, float]]
+
+
+def _init_runtime_fields(nodes: Dict[int, Node]) -> None:
+    for node in nodes.values():
+        setattr(node, "traffic_load_score", 0.0)
+        setattr(node, "ch_cooldown_s", 0.0)
+        setattr(node, "recent_role_switches", 0.0)
 
 
 def _apply_control_overhead(
@@ -130,6 +145,19 @@ def _apply_path_energy(nodes: Dict[int, Node], path: Tuple[int, ...], cfg: SimCo
         node.e_j = max(0.0, node.e_j)
 
 
+def _update_path_load(nodes: Dict[int, Node], path: Tuple[int, ...]) -> None:
+    if len(path) < 2:
+        return
+    for idx, node_id in enumerate(path):
+        if node_id not in nodes or nodes[node_id].e_j <= 0:
+            continue
+        if idx == 0 or idx == len(path) - 1:
+            continue
+        node = nodes[node_id]
+        prev_load = _safe_attr(node, "traffic_load_score", 0.0)
+        setattr(node, "traffic_load_score", min(1.0, prev_load + 0.12))
+
+
 def _interval_reward(
     nodes: Dict[int, Node],
     interval_energy_start: Dict[int, float],
@@ -141,55 +169,96 @@ def _interval_reward(
     interval_isolation_samples: int,
     cfg: SimConfig,
 ) -> float:
-    # Topology stability
-    Rc = 1.0 if interval_role_changes < cfg.role_change_threshold else -1.0
+    alive = [n for n in nodes.values() if n.e_j > 0]
+    if not alive:
+        return -1.0
 
-    # Energy efficiency
+    alive_count = max(1, len(alive))
+
+    # Topology stability: continuous penalty, not binary.
+    churn_ratio = interval_role_changes / alive_count
+    rc = clamp(1.0 - 3.0 * churn_ratio, -1.0, 1.0)
+
+    # Energy efficiency over the last interval.
     deltas: List[float] = []
+    residual_ratios: List[float] = []
     for i, node in nodes.items():
-        if i not in interval_energy_start:
-            continue
-        if node.e0_j <= 0:
-            continue
-        delta = (interval_energy_start[i] - node.e_j) / node.e0_j
-        deltas.append(delta)
+        if i in interval_energy_start and node.e0_j > 0:
+            delta = (interval_energy_start[i] - node.e_j) / node.e0_j
+            deltas.append(delta)
+        if node.e0_j > 0 and node.e_j > 0:
+            residual_ratios.append(node.e_j / node.e0_j)
 
-    delta_e = sum(deltas) / len(deltas) if deltas else 0.0
-    Ec = clamp(1.0 - 2.0 * delta_e, -1.0, 1.0)
+    avg_delta = sum(deltas) / len(deltas) if deltas else 0.0
+    ec = clamp(1.0 - 4.0 * avg_delta, -1.0, 1.0)
 
-    # Packet delivery ratio
+    # Energy balance / lifetime preservation.
+    if residual_ratios:
+        mean_e = sum(residual_ratios) / len(residual_ratios)
+        var_e = sum((x - mean_e) ** 2 for x in residual_ratios) / len(residual_ratios)
+        std_e = var_e ** 0.5
+        balance = clamp(1.0 - 2.2 * std_e, -1.0, 1.0)
+        survival = clamp(2.0 * min(residual_ratios) - 1.0, -1.0, 1.0)
+    else:
+        balance = -1.0
+        survival = -1.0
+
+    # Packet delivery ratio.
     pdr = (
         interval_packets_delivered / interval_packets_generated
         if interval_packets_generated > 0
         else 0.5
     )
-    Pc = clamp(2.0 * pdr - 1.0, -1.0, 1.0)
+    pc = clamp(2.0 * pdr - 1.0, -1.0, 1.0)
 
-    # Delay
+    # Delay.
     avg_delay = (
         interval_delay_sum_s / interval_packets_delivered
         if interval_packets_delivered > 0
         else 0.05
     )
     delay_ref = 0.020
-    Dc = clamp(1.0 - 2.0 * (avg_delay / max(1e-9, delay_ref)), -1.0, 1.0)
+    dc = clamp(1.0 - 1.8 * (avg_delay / max(1e-9, delay_ref)), -1.0, 1.0)
 
-    # Isolation
+    # Isolation.
     iso_avg = (
         interval_isolation_sum / interval_isolation_samples
         if interval_isolation_samples > 0
         else 0.0
     )
-    Ic = clamp(1.0 - 0.5 * iso_avg, -1.0, 1.0)
+    ic = clamp(1.0 - 0.55 * iso_avg, -1.0, 1.0)
 
     reward = (
-        cfg.reward_role_changes_weight * Rc
-        + cfg.reward_energy_weight * Ec
-        + cfg.reward_pdr_weight * Pc
-        + cfg.reward_delay_weight * Dc
-        + cfg.reward_isolation_weight * Ic
+        cfg.reward_role_changes_weight * rc
+        + cfg.reward_energy_weight * ec
+        + cfg.reward_pdr_weight * pc
+        + cfg.reward_delay_weight * dc
+        + cfg.reward_isolation_weight * ic
+        + cfg.reward_balance_weight * balance
+        + cfg.reward_survival_weight * survival
     )
     return reward_transform(clamp(reward, -1.0, 1.0))
+
+
+def _decay_runtime_fields(nodes: Dict[int, Node], cfg: SimConfig) -> None:
+    for node in nodes.values():
+        if node.e_j <= 0:
+            continue
+        setattr(
+            node,
+            "traffic_load_score",
+            clamp(_safe_attr(node, "traffic_load_score", 0.0) * cfg.traffic_load_decay, 0.0, 1.0),
+        )
+        setattr(
+            node,
+            "recent_role_switches",
+            clamp(_safe_attr(node, "recent_role_switches", 0.0) * cfg.recent_role_change_decay, 0.0, 1.0),
+        )
+        setattr(
+            node,
+            "ch_cooldown_s",
+            max(0.0, _safe_attr(node, "ch_cooldown_s", 0.0) - cfg.cooldown_decay_per_round_s),
+        )
 
 
 def run_simulation(
@@ -220,6 +289,8 @@ def run_simulation(
             e0_j=e0,
             e_j=e0,
         )
+
+    _init_runtime_fields(nodes)
 
     mobility = GaussMarkovMobility(
         alpha=cfg.gauss_markov_alpha,
@@ -259,12 +330,22 @@ def run_simulation(
         gateway_stability_weight=cfg.gateway_stability_weight,
         gateway_multicluster_bonus=cfg.gateway_multicluster_bonus,
         direct_ch_link_bonus=cfg.direct_ch_link_bonus,
+        ch_energy_guard_ratio=cfg.ch_energy_guard_ratio,
+        ch_cooldown_s=cfg.ch_cooldown_s,
+        recent_ch_penalty_weight=cfg.recent_ch_penalty_weight,
+        traffic_load_penalty_weight=cfg.traffic_load_penalty_weight,
+        degree_balance_bonus_weight=cfg.degree_balance_bonus_weight,
+        tenure_stability_bonus_weight=cfg.tenure_stability_bonus_weight,
+        link_stability_bonus_weight=cfg.link_stability_bonus_weight,
+        velocity_stability_bonus_weight=cfg.velocity_stability_bonus_weight,
+        local_degree_target=cfg.local_degree_target,
+        local_degree_tolerance=cfg.local_degree_tolerance,
     )
     wca_clusterer = WCAClusterer(cfg.comm_radius_m)
     dca_clusterer = DCAClusterer()
 
     q_strategy: Optional[QLearningStrategy] = None
-    current_weights = (0.25, 0.25, 0.25, 0.25)
+    current_weights = (0.30, 0.15, 0.20, 0.35)
     prev_state = None
     prev_action = None
 
@@ -304,6 +385,8 @@ def run_simulation(
     interval_isolation_sum: float = 0.0
     interval_isolation_samples: int = 0
 
+    cluster_round_idx = 0
+
     for t in range(0, cfg.sim_time_s, int(cfg.dt_s)):
         for node in nodes.values():
             if node.e_j <= 0:
@@ -333,13 +416,18 @@ def run_simulation(
             node.s4 = factors.s4_lht
 
         if t % cfg.clustering_interval_s == 0:
+            _decay_runtime_fields(nodes, cfg)
             role_counts_before = {i: n.role_change_count for i, n in nodes.items()}
 
             if protocol == "icra":
                 assert q_strategy is not None
                 s = network_state(nodes)
 
-                if prev_state is not None and prev_action is not None:
+                if (
+                    prev_state is not None
+                    and prev_action is not None
+                    and cluster_round_idx >= cfg.clustering_warmup_rounds
+                ):
                     reward = _interval_reward(
                         nodes=nodes,
                         interval_energy_start=interval_energy_start,
@@ -398,6 +486,7 @@ def run_simulation(
             interval_delay_sum_s = 0.0
             interval_isolation_sum = 0.0
             interval_isolation_samples = 0
+            cluster_round_idx += 1
 
         alive_ids = [i for i, n in nodes.items() if n.e_j > 0]
         if alive_ids:
@@ -419,6 +508,7 @@ def run_simulation(
                     delay_sum_s += pkt.delay_s
                     interval_delay_sum_s += pkt.delay_s
                     _apply_path_energy(nodes, pkt.path, cfg)
+                    _update_path_load(nodes, pkt.path)
 
         _apply_steady_energy(nodes, cfg, cfg.dt_s)
 
