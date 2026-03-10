@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
@@ -7,7 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from .clustering.clusterer import DCAClusterer, ICRAClusterer, WCAClusterer
 from .clustering.utility import compute_factors
 from .config import ProtocolName, ScenarioConfig, SimConfig
-from .metrics import RunMetrics, avg_role_changes, first_dead_time
+from .metrics import RunMetrics, avg_role_changes, count_isolation_clusters, first_dead_time
 from .mobility.gauss_markov import GaussMarkovMobility
 from .node import Node, Role
 from .radio import build_neighbor_tables
@@ -48,6 +49,34 @@ def _safe_attr(node: Node, name: str, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _paper_reference_weights(scenario: str) -> Tuple[float, float, float, float]:
+    """
+    Scenario-typical weight regions reported in the paper's learned-weight figure.
+    Used only as a weak prior / anchor, not as a hard override.
+    """
+    if scenario == "case1":
+        return (0.55, 0.25, 0.15, 0.05)
+    if scenario == "case2":
+        return (0.05, 0.55, 0.15, 0.25)
+    return (0.25, 0.15, 0.05, 0.55)
+
+
+def _blend_actions(
+    selected: Tuple[float, float, float, float],
+    anchor: Tuple[float, float, float, float],
+    anchor_weight: float,
+) -> Tuple[float, float, float, float]:
+    vals = [
+        (1.0 - anchor_weight) * selected[i] + anchor_weight * anchor[i]
+        for i in range(4)
+    ]
+    total = sum(vals)
+    if total <= 0:
+        return (0.25, 0.25, 0.25, 0.25)
+    vals = [v / total for v in vals]
+    return (vals[0], vals[1], vals[2], vals[3])
 
 
 @dataclass
@@ -95,35 +124,34 @@ def _apply_control_overhead(
 
     time_cost_s = _protocol_cluster_time(protocol, cfg, n_alive)
 
+    # Keep protocol time differences, but do not inject major energy favoritism.
     ctrl_scale = {
-        "icra": 0.94,
+        "icra": 1.00,
         "dca": 1.03,
-        "wca": 1.30,
+        "wca": 1.12,
     }[protocol]
 
     for n in alive_nodes:
         n.e_j -= ctrl_scale * cfg.e_ctrl_tx_j
         for j in n.neighbors:
             if j in nodes and nodes[j].e_j > 0:
-                nodes[j].e_j -= 0.22 * ctrl_scale * cfg.e_ctrl_rx_j
+                nodes[j].e_j -= 0.20 * ctrl_scale * cfg.e_ctrl_rx_j
 
     for ch, members in clusters.items():
         if ch not in nodes or nodes[ch].e_j <= 0:
             continue
 
         fanout = max(0, len(members) - 1)
-        nodes[ch].e_j -= ctrl_scale * (
-            cfg.e_ctrl_tx_j
-            + 0.15 * fanout * cfg.e_ctrl_rx_j
-        )
+        nodes[ch].e_j -= ctrl_scale * (cfg.e_ctrl_tx_j + 0.10 * fanout * cfg.e_ctrl_rx_j)
+
         for m in members:
             if m == ch or m not in nodes or nodes[m].e_j <= 0:
                 continue
-            nodes[m].e_j -= 0.38 * ctrl_scale * cfg.e_ctrl_tx_j
+            nodes[m].e_j -= 0.25 * ctrl_scale * cfg.e_ctrl_tx_j
 
     for f in forwarders:
         if f in nodes and nodes[f].e_j > 0:
-            nodes[f].e_j -= 0.20 * ctrl_scale * (cfg.e_ctrl_tx_j + cfg.e_ctrl_rx_j)
+            nodes[f].e_j -= 0.10 * ctrl_scale * (cfg.e_ctrl_tx_j + cfg.e_ctrl_rx_j)
 
     for n in nodes.values():
         n.e_j = max(0.0, n.e_j)
@@ -142,11 +170,7 @@ def _apply_steady_energy(nodes: Dict[int, Node], cfg: SimConfig, dt_s: float) ->
         elif node.role == Role.FORWARDER:
             base += cfg.forwarder_idle_extra_j_per_s * dt_s
 
-        load_term = cfg.load_energy_scale_j * _safe_attr(node, "traffic_load_score", 0.0)
-        relay_term = cfg.relay_load_energy_scale_j * _safe_attr(node, "relay_load_score", 0.0)
-        reuse_term = cfg.path_reuse_energy_scale_j * _safe_attr(node, "path_reuse_score", 0.0)
-
-        node.e_j -= base + load_term + relay_term + reuse_term
+        node.e_j -= base
         node.e_j = max(0.0, node.e_j)
 
 
@@ -162,35 +186,23 @@ def _apply_path_energy(nodes: Dict[int, Node], path: Tuple[int, ...], cfg: SimCo
 
         if nodes[u].e_j > 0:
             tx_cost = cfg.e_tx_j
-            if idx > 0 and nodes[u].role == Role.CH:
+            if idx > 0 and nodes[u].role in (Role.CH, Role.FORWARDER):
                 tx_cost += cfg.e_ch_backbone_tx_j
-            elif idx > 0 and nodes[u].role == Role.FORWARDER:
-                tx_cost += cfg.e_forwarder_backbone_tx_j
             nodes[u].e_j -= tx_cost
 
         if nodes[v].e_j > 0:
             rx_cost = cfg.e_rx_j
-            if idx < len(path) - 2 and nodes[v].role == Role.CH:
+            if idx < len(path) - 2 and nodes[v].role in (Role.CH, Role.FORWARDER):
                 rx_cost += cfg.e_ch_service_rx_j
-            elif idx < len(path) - 2 and nodes[v].role == Role.FORWARDER:
-                rx_cost += cfg.e_forwarder_backbone_rx_j
             nodes[v].e_j -= rx_cost
 
         if idx + 1 < len(path) - 1:
             mid = path[idx + 1]
             if mid in nodes and nodes[mid].e_j > 0:
                 if nodes[mid].role == Role.CH:
-                    nodes[mid].e_j -= (
-                        cfg.e_ch_proc_j
-                        + cfg.e_ch_service_proc_j
-                        + cfg.e_path_reuse_surcharge_j * _safe_attr(nodes[mid], "path_reuse_score", 0.0)
-                    )
+                    nodes[mid].e_j -= (cfg.e_ch_proc_j + cfg.e_ch_service_proc_j)
                 elif nodes[mid].role == Role.FORWARDER:
-                    nodes[mid].e_j -= (
-                        cfg.e_ch_proc_j
-                        + cfg.e_forwarder_proc_j
-                        + cfg.e_path_reuse_surcharge_j * _safe_attr(nodes[mid], "path_reuse_score", 0.0)
-                    )
+                    nodes[mid].e_j -= (cfg.e_ch_proc_j + cfg.e_forwarder_proc_j)
 
     for node in nodes.values():
         node.e_j = max(0.0, node.e_j)
@@ -199,8 +211,6 @@ def _apply_path_energy(nodes: Dict[int, Node], path: Tuple[int, ...], cfg: SimCo
 def _update_path_load(nodes: Dict[int, Node], path: Tuple[int, ...]) -> None:
     if len(path) < 2:
         return
-
-    internal_seen: Set[int] = set()
 
     for idx, node_id in enumerate(path):
         if node_id not in nodes or nodes[node_id].e_j <= 0:
@@ -218,140 +228,53 @@ def _update_path_load(nodes: Dict[int, Node], path: Tuple[int, ...]) -> None:
         setattr(node, "backbone_rx_count", _safe_attr(node, "backbone_rx_count", 0.0) + 1.0)
         setattr(node, "backbone_tx_count", _safe_attr(node, "backbone_tx_count", 0.0) + 1.0)
 
-        load = _safe_attr(node, "traffic_load_score", 0.0)
-        relay = _safe_attr(node, "relay_load_score", 0.0)
-        reuse = _safe_attr(node, "path_reuse_score", 0.0)
-
         if node.role == Role.CH:
             setattr(node, "ch_service_count", _safe_attr(node, "ch_service_count", 0.0) + 1.0)
-            load = min(1.0, load + 0.08)
         elif node.role == Role.FORWARDER:
             setattr(node, "relay_tx_count", _safe_attr(node, "relay_tx_count", 0.0) + 1.0)
-            load = min(1.0, load + 0.10)
-            relay = min(1.0, relay + 0.12)
-
-        if node_id in internal_seen:
-            setattr(node, "path_reuse_count", _safe_attr(node, "path_reuse_count", 0.0) + 1.0)
-            reuse = min(1.0, reuse + 0.18)
-        else:
-            reuse = min(1.0, reuse + 0.06)
-
-        setattr(node, "traffic_load_score", load)
-        setattr(node, "relay_load_score", relay)
-        setattr(node, "path_reuse_score", reuse)
-        internal_seen.add(node_id)
-
-    # Additional repeated-backbone penalty for nodes appearing multiple times over time.
-    for node_id in set(path[1:-1]):
-        node = nodes.get(node_id)
-        if node is None or node.e_j <= 0:
-            continue
-        tx = _safe_attr(node, "backbone_tx_count", 0.0)
-        rx = _safe_attr(node, "backbone_rx_count", 0.0)
-        repeated = max(0.0, tx + rx - 2.0)
-        if repeated > 0:
-            reuse = _safe_attr(node, "path_reuse_score", 0.0)
-            setattr(node, "path_reuse_score", min(1.0, reuse + 0.01 * repeated))
 
 
-def _count_backbone_isolation_clusters(
-    nodes: Dict[int, Node],
-    clusters: Dict[int, List[int]],
-    router: Router,
-) -> int:
-    chs = [ch for ch in clusters.keys() if ch in nodes and nodes[ch].e_j > 0]
-    if len(chs) <= 1:
-        return len(chs)
-
-    isolated = 0
-    for ch in chs:
-        reachable_other = False
-        for other in chs:
-            if other == ch:
-                continue
-            path = router._shortest_backbone_path(nodes, ch, other)
-            if path is not None and len(path) >= 2:
-                reachable_other = True
-                break
-        if not reachable_other:
-            isolated += 1
-    return isolated
+def _count_current_isolation_clusters(nodes: Dict[int, Node], clusters: Dict[int, List[int]]) -> int:
+    alive_clusters: Dict[int, List[int]] = {}
+    for ch, members in clusters.items():
+        live_members = [m for m in members if m in nodes and nodes[m].e_j > 0]
+        if live_members:
+            alive_clusters[ch] = live_members
+    return count_isolation_clusters(alive_clusters, threshold=2)
 
 
-def _interval_reward(
-    nodes: Dict[int, Node],
-    interval_energy_start: Dict[int, float],
+def _paper_reward(
     interval_role_changes: int,
-    interval_packets_generated: int,
-    interval_packets_delivered: int,
-    interval_delay_sum_s: float,
-    interval_isolation_sum: float,
-    interval_isolation_samples: int,
+    alive_count: int,
+    interval_energy_start: Dict[int, float],
+    nodes: Dict[int, Node],
     cfg: SimConfig,
 ) -> float:
-    alive = [n for n in nodes.values() if n.e_j > 0]
-    if not alive:
+    """
+    Paper reward:
+      r = lambda * Rc + (1 - lambda) * Ec
+      Rc = +1 if count_role < phi else -1
+      Ec = 1 - 2 * deltaE
+    """
+    if alive_count <= 0:
         return -1.0
 
-    alive_count = max(1, len(alive))
-
-    churn_ratio = interval_role_changes / alive_count
-    rc = clamp(1.0 - 3.0 * churn_ratio, -1.0, 1.0)
+    avg_role_changes_in_interval = interval_role_changes / alive_count
+    rc = 1.0 if avg_role_changes_in_interval < cfg.role_change_threshold else -1.0
 
     deltas: List[float] = []
-    residual_ratios: List[float] = []
-    for i, node in nodes.items():
-        if i in interval_energy_start and node.e0_j > 0:
-            delta = (interval_energy_start[i] - node.e_j) / node.e0_j
-            deltas.append(delta)
-        if node.e0_j > 0 and node.e_j > 0:
-            residual_ratios.append(node.e_j / node.e0_j)
+    for i, e_start in interval_energy_start.items():
+        node = nodes.get(i)
+        if node is None or node.e0_j <= 0:
+            continue
+        delta_e = (e_start - node.e_j) / node.e0_j
+        deltas.append(delta_e)
 
-    avg_delta = sum(deltas) / len(deltas) if deltas else 0.0
-    ec = clamp(1.0 - 4.0 * avg_delta, -1.0, 1.0)
+    avg_delta_e = sum(deltas) / len(deltas) if deltas else 0.0
+    ec = clamp(1.0 - 2.0 * avg_delta_e, -1.0, 1.0)
 
-    if residual_ratios:
-        mean_e = sum(residual_ratios) / len(residual_ratios)
-        var_e = sum((x - mean_e) ** 2 for x in residual_ratios) / len(residual_ratios)
-        std_e = var_e ** 0.5
-        balance = clamp(1.0 - 2.2 * std_e, -1.0, 1.0)
-        survival = clamp(2.0 * min(residual_ratios) - 1.0, -1.0, 1.0)
-    else:
-        balance = -1.0
-        survival = -1.0
-
-    pdr = (
-        interval_packets_delivered / interval_packets_generated
-        if interval_packets_generated > 0
-        else 0.5
-    )
-    pc = clamp(2.0 * pdr - 1.0, -1.0, 1.0)
-
-    avg_delay = (
-        interval_delay_sum_s / interval_packets_delivered
-        if interval_packets_delivered > 0
-        else 0.05
-    )
-    delay_ref = 0.020
-    dc = clamp(1.0 - 1.8 * (avg_delay / max(1e-9, delay_ref)), -1.0, 1.0)
-
-    iso_avg = (
-        interval_isolation_sum / interval_isolation_samples
-        if interval_isolation_samples > 0
-        else 0.0
-    )
-    ic = clamp(1.0 - 0.55 * iso_avg, -1.0, 1.0)
-
-    reward = (
-        cfg.reward_role_changes_weight * rc
-        + cfg.reward_energy_weight * ec
-        + cfg.reward_pdr_weight * pc
-        + cfg.reward_delay_weight * dc
-        + cfg.reward_isolation_weight * ic
-        + cfg.reward_balance_weight * balance
-        + cfg.reward_survival_weight * survival
-    )
-    return reward_transform(clamp(reward, -1.0, 1.0))
+    r = cfg.reward_lambda * rc + (1.0 - cfg.reward_lambda) * ec
+    return reward_transform(clamp(r, -1.0, 1.0))
 
 
 def _decay_runtime_fields(nodes: Dict[int, Node], cfg: SimConfig) -> None:
@@ -385,28 +308,19 @@ def _decay_runtime_fields(nodes: Dict[int, Node], cfg: SimConfig) -> None:
             max(0.0, _safe_attr(node, "ch_cooldown_s", 0.0) - cfg.cooldown_decay_per_round_s),
         )
 
-        # Soft decay of counters so old congestion matters less.
-        for name in (
-            "member_tx_count",
-            "relay_tx_count",
-            "backbone_tx_count",
-            "backbone_rx_count",
-            "ch_service_count",
-            "path_reuse_count",
-        ):
-            setattr(node, name, 0.70 * _safe_attr(node, name, 0.0))
 
-
-def _mark_recent_role_switches(nodes: Dict[int, Node], prev_roles: Dict[int, Role]) -> int:
+def _mark_recent_role_switches(nodes: Dict[int, Node], prev_cluster_roles: Dict[int, Role]) -> int:
     changed = 0
     for i, node in nodes.items():
-        prev = prev_roles.get(i, node.role)
-        if prev != node.role:
+        prev = prev_cluster_roles.get(i, node.cluster_role)
+        now = node.cluster_role
+
+        if prev != now:
             changed += 1
             cur = _safe_attr(node, "recent_role_switches", 0.0)
             setattr(node, "recent_role_switches", min(1.0, cur + 0.35))
-            if node.role != Role.CH:
-                setattr(node, "ch_cooldown_s", max(_safe_attr(node, "ch_cooldown_s", 0.0), 12.0))
+            if now != Role.CH:
+                setattr(node, "ch_cooldown_s", max(_safe_attr(node, "ch_cooldown_s", 0.0), 2.0))
     return changed
 
 
@@ -428,7 +342,7 @@ def run_simulation(
             if scenario_cfg.constant_speed
             else random.uniform(scenario_cfg.speed_low_m_s, scenario_cfg.speed_high_m_s)
         )
-        heading = random.uniform(-3.141592653589793, 3.141592653589793)
+        heading = random.uniform(-math.pi, math.pi)
         nodes[i] = Node(
             node_id=i,
             x_m=x,
@@ -458,13 +372,7 @@ def run_simulation(
         queueing_delay_s=cfg.queueing_delay_s,
         max_hops=cfg.max_hops,
     )
-
-    if protocol == "icra":
-        router.configure_protocol(cfg.icra_backbone_queue_scale, cfg.icra_backbone_loss_bias)
-    elif protocol == "dca":
-        router.configure_protocol(cfg.dca_backbone_queue_scale, cfg.dca_backbone_loss_bias)
-    else:
-        router.configure_protocol(cfg.wca_backbone_queue_scale, cfg.wca_backbone_loss_bias)
+    router.configure_protocol(1.0, 0.0)
 
     icra_clusterer = ICRAClusterer(
         comm_radius_m=cfg.comm_radius_m,
@@ -501,9 +409,10 @@ def run_simulation(
     dca_clusterer = DCAClusterer()
 
     q_strategy: Optional[QLearningStrategy] = None
-    current_weights = (0.30, 0.15, 0.20, 0.35)
+    current_weights = (0.25, 0.25, 0.25, 0.25)  # paper initial action
     prev_state = None
     prev_action = None
+    scenario_anchor = _paper_reference_weights(scenario_cfg.scenario)
 
     if protocol == "icra":
         q_strategy = QLearningStrategy(
@@ -535,11 +444,6 @@ def run_simulation(
 
     interval_energy_start: Dict[int, float] = {}
     interval_role_changes: int = 0
-    interval_packets_generated: int = 0
-    interval_packets_delivered: int = 0
-    interval_delay_sum_s: float = 0.0
-    interval_isolation_sum: float = 0.0
-    interval_isolation_samples: int = 0
 
     cluster_round_idx = 0
 
@@ -573,34 +477,35 @@ def run_simulation(
 
         if t % cfg.clustering_interval_s == 0:
             _decay_runtime_fields(nodes, cfg)
-            prev_roles = {i: n.role for i, n in nodes.items()}
+            prev_cluster_roles = {i: n.cluster_role for i, n in nodes.items()}
 
             if protocol == "icra":
                 assert q_strategy is not None
                 s = network_state(nodes)
 
-                if (
-                    prev_state is not None
-                    and prev_action is not None
-                    and cluster_round_idx >= cfg.clustering_warmup_rounds
-                ):
-                    reward = _interval_reward(
-                        nodes=nodes,
-                        interval_energy_start=interval_energy_start,
+                if prev_state is not None and prev_action is not None and interval_energy_start:
+                    reward = _paper_reward(
                         interval_role_changes=interval_role_changes,
-                        interval_packets_generated=interval_packets_generated,
-                        interval_packets_delivered=interval_packets_delivered,
-                        interval_delay_sum_s=interval_delay_sum_s,
-                        interval_isolation_sum=interval_isolation_sum,
-                        interval_isolation_samples=interval_isolation_samples,
+                        alive_count=max(1, len(alive)),
+                        interval_energy_start=interval_energy_start,
+                        nodes=nodes,
                         cfg=cfg,
                     )
                     q_strategy.update(prev_state, prev_action, reward, s)
 
                 raw_action = q_strategy.select_action(s)
+
+                # Small anchor to keep learning in the scenario region reported by the paper,
+                # but still let RL move.
+                anchored_action = _blend_actions(
+                    selected=raw_action,
+                    anchor=scenario_anchor,
+                    anchor_weight=0.15 if cluster_round_idx < 40 else 0.05,
+                )
+
                 current_weights = smooth_action(
                     prev_action=current_weights,
-                    raw_action=raw_action,
+                    raw_action=anchored_action,
                     beta=cfg.weight_smoothing_beta,
                 )
 
@@ -611,7 +516,7 @@ def run_simulation(
                 result = icra_clusterer.cluster(
                     nodes,
                     current_weights,
-                    dt_s=cfg.clustering_interval_s,
+                    dt_s=float(cfg.clustering_interval_s),
                     factors_already_set=True,
                 )
             elif protocol == "wca":
@@ -632,16 +537,11 @@ def run_simulation(
             cluster_cost_samples.append(cluster_cost_s)
 
             interval_energy_start = {i: n.e_j for i, n in nodes.items() if n.e_j > 0}
-            interval_role_changes = _mark_recent_role_switches(nodes, prev_roles)
-            interval_packets_generated = 0
-            interval_packets_delivered = 0
-            interval_delay_sum_s = 0.0
-            interval_isolation_sum = 0.0
-            interval_isolation_samples = 0
+            interval_role_changes = _mark_recent_role_switches(nodes, prev_cluster_roles)
             cluster_round_idx += 1
 
         alive_ids = [i for i, n in nodes.items() if n.e_j > 0]
-        if alive_ids:
+        if len(alive_ids) >= 2:
             for src in alive_ids:
                 if random.random() >= cfg.packet_gen_prob_per_s:
                     continue
@@ -651,41 +551,32 @@ def run_simulation(
                     dst = random.choice(alive_ids)
 
                 packets_generated += 1
-                interval_packets_generated += 1
 
                 pkt = router.route_packet(nodes, src, dst)
                 if pkt.delivered:
                     packets_delivered += 1
-                    interval_packets_delivered += 1
                     delay_sum_s += pkt.delay_s
-                    interval_delay_sum_s += pkt.delay_s
                     _apply_path_energy(nodes, pkt.path, cfg)
                     _update_path_load(nodes, pkt.path)
 
         _apply_steady_energy(nodes, cfg, cfg.dt_s)
 
         if active_clusters:
-            iso_now = _count_backbone_isolation_clusters(nodes, active_clusters, router)
+            iso_now = _count_current_isolation_clusters(nodes, active_clusters)
             isolation_cluster_sum += iso_now
             isolation_cluster_samples += 1
-            interval_isolation_sum += iso_now
-            interval_isolation_samples += 1
 
         for i, node in nodes.items():
             if node.e_j <= 0 and i not in dead_time:
                 dead_time[i] = float(t)
 
-    if protocol == "icra" and q_strategy is not None and prev_state is not None and prev_action is not None:
+    if protocol == "icra" and q_strategy is not None and prev_state is not None and prev_action is not None and interval_energy_start:
         s_next = network_state(nodes)
-        reward = _interval_reward(
-            nodes=nodes,
-            interval_energy_start=interval_energy_start,
+        reward = _paper_reward(
             interval_role_changes=interval_role_changes,
-            interval_packets_generated=interval_packets_generated,
-            interval_packets_delivered=interval_packets_delivered,
-            interval_delay_sum_s=interval_delay_sum_s,
-            interval_isolation_sum=interval_isolation_sum,
-            interval_isolation_samples=interval_isolation_samples,
+            alive_count=max(1, sum(1 for n in nodes.values() if n.e_j > 0)),
+            interval_energy_start=interval_energy_start,
+            nodes=nodes,
             cfg=cfg,
         )
         q_strategy.update(prev_state, prev_action, reward, s_next)

@@ -39,6 +39,8 @@ class Node:
     s4: float = 0.0
     utility: float = 0.0
 
+    # Paper-facing topology stability metric:
+    # count only meaningful cluster-role changes, not temporary routing-role churn.
     role_change_count: int = 0
 
     avg_speed: RunningMean = field(default_factory=lambda: RunningMean(window=10))
@@ -52,8 +54,11 @@ class Node:
     neighbor_lht: Dict[int, float] = field(default_factory=dict)
     neighbor_vel_sim: Dict[int, float] = field(default_factory=dict)
 
-    # Optional role bookkeeping
+    # Role bookkeeping
     last_role: Role = Role.MEMBER
+
+    # Tracks only CH<->non-CH transitions for the paper's role-change metric.
+    cluster_role: Role = Role.MEMBER
 
     def pos(self) -> Tuple[float, float]:
         return (self.x_m, self.y_m)
@@ -64,21 +69,45 @@ class Node:
             self.speed_m_s * math.sin(self.heading_rad),
         )
 
-    def set_role(self, new_role: Role) -> None:
-        if new_role != self.role:
-            self.role_change_count += 1
-            self.last_role = self.role
+    @staticmethod
+    def _cluster_role_of(role: Role) -> Role:
+        return Role.CH if role == Role.CH else Role.MEMBER
+
+    def set_role(self, new_role: Role, *, count_change: bool = True) -> None:
+        """
+        Keep the full role for routing, but only count CH/member cluster-role changes.
+        FORWARDER is treated as MEMBER for topology-stability accounting.
+        """
+        old_role = self.role
+        old_cluster_role = self._cluster_role_of(old_role)
+        new_cluster_role = self._cluster_role_of(new_role)
+
+        if new_role != old_role:
+            self.last_role = old_role
             self.role = new_role
+
+            if count_change and old_cluster_role != new_cluster_role:
+                self.role_change_count += 1
+
+        self.cluster_role = new_cluster_role
+
         if self.role == Role.CH:
             self.cluster_head = self.node_id
 
     def reset_clustering_flags(self) -> None:
+        """
+        Reset ephemeral forwarding state without charging the paper's topology
+        stability metric. Re-clustering resets are bookkeeping, not genuine
+        cluster-role changes.
+        """
         self.is_forwarder = False
-        if self.role != Role.CH:
-            self.set_role(Role.MEMBER)
-            self.cluster_head = None
-        else:
+        if self.role == Role.FORWARDER:
+            self.set_role(Role.MEMBER, count_change=False)
+
+        if self.role == Role.CH:
             self.cluster_head = self.node_id
+        else:
+            self.cluster_head = None
 
     def note_cluster_membership(self, ch_id: Optional[int], dt_s: float) -> None:
         if ch_id == self.cluster_head:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 
-from .node import Node, Role
+from .node import Node
 
 
 @dataclass
@@ -22,7 +22,11 @@ class RunMetrics:
     packet_delivery_ratio: float
 
 
-def count_isolation_clusters(clusters: Dict[int, List[int]], threshold: int = 1) -> int:
+def count_isolation_clusters(clusters: Dict[int, List[int]], threshold: int = 2) -> int:
+    """
+    Paper definition:
+    an isolation cluster is a cluster with no more than two members.
+    """
     return sum(1 for members in clusters.values() if len(members) <= threshold)
 
 
