@@ -175,11 +175,9 @@ def _interval_reward(
 
     alive_count = max(1, len(alive))
 
-    # Topology stability: continuous penalty, not binary.
     churn_ratio = interval_role_changes / alive_count
     rc = clamp(1.0 - 3.0 * churn_ratio, -1.0, 1.0)
 
-    # Energy efficiency over the last interval.
     deltas: List[float] = []
     residual_ratios: List[float] = []
     for i, node in nodes.items():
@@ -192,7 +190,6 @@ def _interval_reward(
     avg_delta = sum(deltas) / len(deltas) if deltas else 0.0
     ec = clamp(1.0 - 4.0 * avg_delta, -1.0, 1.0)
 
-    # Energy balance / lifetime preservation.
     if residual_ratios:
         mean_e = sum(residual_ratios) / len(residual_ratios)
         var_e = sum((x - mean_e) ** 2 for x in residual_ratios) / len(residual_ratios)
@@ -203,7 +200,6 @@ def _interval_reward(
         balance = -1.0
         survival = -1.0
 
-    # Packet delivery ratio.
     pdr = (
         interval_packets_delivered / interval_packets_generated
         if interval_packets_generated > 0
@@ -211,7 +207,6 @@ def _interval_reward(
     )
     pc = clamp(2.0 * pdr - 1.0, -1.0, 1.0)
 
-    # Delay.
     avg_delay = (
         interval_delay_sum_s / interval_packets_delivered
         if interval_packets_delivered > 0
@@ -220,7 +215,6 @@ def _interval_reward(
     delay_ref = 0.020
     dc = clamp(1.0 - 1.8 * (avg_delay / max(1e-9, delay_ref)), -1.0, 1.0)
 
-    # Isolation.
     iso_avg = (
         interval_isolation_sum / interval_isolation_samples
         if interval_isolation_samples > 0

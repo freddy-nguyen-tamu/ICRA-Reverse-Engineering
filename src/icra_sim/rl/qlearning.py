@@ -35,7 +35,6 @@ def _role_mix_score(nodes: List[Node]) -> float:
     counts = Counter(n.role.value for n in nodes)
     total = len(nodes)
     probs = [c / total for c in counts.values()]
-    # normalized entropy proxy over present roles
     if len(probs) <= 1:
         return 0.0
     import math
@@ -189,15 +188,12 @@ class QLearningStrategy:
     def _prior_score(self, a: Action) -> float:
         w1, w2, w3, w4 = a
 
-        # Encourage paper-like stability: energy and LHT matter most,
-        # but do not collapse into pure-energy behavior.
         score = 0.0
         score += 0.035 * min(w1, 0.40)
         score += 0.040 * min(w4, 0.40)
         score += 0.020 * min(w3, 0.30)
         score += 0.010 * min(w2, 0.25)
 
-        # Penalize degenerate edge-of-simplex policies.
         if w1 >= 0.55:
             score -= 0.060
         if w4 < 0.15:
@@ -207,7 +203,6 @@ class QLearningStrategy:
         if w2 > 0.35:
             score -= 0.015
 
-        # Soft preference for balanced "stable-clustering" profiles.
         score -= 0.025 * abs(w1 - 0.30)
         score -= 0.020 * abs(w4 - 0.30)
         return score

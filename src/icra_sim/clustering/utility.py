@@ -72,9 +72,6 @@ def degree_centrality_factor(node: Node, nodes: Dict[int, Node]) -> float:
     global_deg = deg / max(1, len(alive_nodes) - 1)
     local_deg = deg / max(1, max_deg)
 
-    # Prevent s2 from becoming vanishingly small in sparse N=100 runs.
-    # The paper still wants degree centrality, but practical behavior is closer
-    # when it is normalized both globally and locally.
     return clamp(0.35 * global_deg + 0.65 * local_deg, 0.0, 1.0)
 
 
