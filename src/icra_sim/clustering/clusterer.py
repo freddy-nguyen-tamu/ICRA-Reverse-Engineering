@@ -19,6 +19,14 @@ class ClusterResult:
     forwarders: Set[int]
 
 
+@dataclass(frozen=True)
+class GatewayCandidate:
+    node_id: int
+    own_ch: int
+    reachable_chs: Tuple[int, ...]
+    score: float
+
+
 class ICRAClusterer:
     def __init__(
         self,
@@ -30,17 +38,40 @@ class ICRAClusterer:
         ch_retain_margin: float = 0.10,
         min_ch_tenure_s: float = 12.0,
         max_cluster_members: int = 18,
-        min_gateway_lht_s: float = 0.25,
+        min_gateway_lht_s: float = 0.18,
+        min_ch_neighbor_count: int = 1,
+        prefer_connected_ch_bonus: float = 0.10,
+        isolated_ch_penalty: float = 0.12,
+        forwarder_reuse_bonus: float = 0.07,
+        gateway_crosslink_weight: float = 0.50,
+        gateway_utility_weight: float = 0.18,
+        gateway_energy_weight: float = 0.12,
+        gateway_stability_weight: float = 0.10,
+        gateway_multicluster_bonus: float = 0.10,
+        direct_ch_link_bonus: float = 0.08,
     ) -> None:
         self.comm_radius_m = comm_radius_m
         self.lht_threshold_s = lht_threshold_s
         self.lht_cap_s = lht_cap_s
         self.v_max = v_max
+
         self.join_hysteresis_margin = join_hysteresis_margin
         self.ch_retain_margin = ch_retain_margin
         self.min_ch_tenure_s = min_ch_tenure_s
         self.max_cluster_members = max_cluster_members
         self.min_gateway_lht_s = min_gateway_lht_s
+
+        self.min_ch_neighbor_count = min_ch_neighbor_count
+        self.prefer_connected_ch_bonus = prefer_connected_ch_bonus
+        self.isolated_ch_penalty = isolated_ch_penalty
+
+        self.forwarder_reuse_bonus = forwarder_reuse_bonus
+        self.gateway_crosslink_weight = gateway_crosslink_weight
+        self.gateway_utility_weight = gateway_utility_weight
+        self.gateway_energy_weight = gateway_energy_weight
+        self.gateway_stability_weight = gateway_stability_weight
+        self.gateway_multicluster_bonus = gateway_multicluster_bonus
+        self.direct_ch_link_bonus = direct_ch_link_bonus
 
     def _ensure_factors(self, alive: Dict[int, Node]) -> None:
         for node in alive.values():
@@ -57,7 +88,7 @@ class ICRAClusterer:
             node.s3 = factors.s3_vel_sim
             node.s4 = factors.s4_lht
 
-    def _compute_utilities(
+    def _compute_base_utilities(
         self,
         alive: Dict[int, Node],
         weights: Tuple[float, float, float, float],
@@ -73,12 +104,32 @@ class ICRAClusterer:
             )
             node.utility = weighted_utility(factors, weights)
 
+    def _would_be_connected_ch(self, node_id: int, alive: Dict[int, Node]) -> bool:
+        nbrs = _alive_neighbors(alive[node_id], alive)
+        if len(nbrs) < self.min_ch_neighbor_count:
+            return False
+
+        strong_links = 0
+        for j in nbrs:
+            lht = link_holding_time_s(alive[node_id], alive[j], self.comm_radius_m)
+            if lht >= self.min_gateway_lht_s:
+                strong_links += 1
+        return strong_links >= self.min_ch_neighbor_count
+
+    def _apply_connectivity_bonus(self, alive: Dict[int, Node]) -> None:
+        for i, node in alive.items():
+            if self._would_be_connected_ch(i, alive):
+                node.utility += self.prefer_connected_ch_bonus
+            else:
+                node.utility -= self.isolated_ch_penalty
+
     def _retain_existing_chs(self, alive: Dict[int, Node]) -> Set[int]:
         retained: Set[int] = set()
 
         for i, node in alive.items():
             if node.role != Role.CH:
                 continue
+
             if getattr(node, "ch_tenure_s", 0.0) < self.min_ch_tenure_s:
                 retained.add(i)
                 continue
@@ -89,7 +140,11 @@ class ICRAClusterer:
                 continue
 
             best_neighbor_utility = max(alive[j].utility for j in nbrs)
-            if node.utility + self.ch_retain_margin >= best_neighbor_utility:
+            retain_margin = self.ch_retain_margin
+            if self._would_be_connected_ch(i, alive):
+                retain_margin += 0.04
+
+            if node.utility + retain_margin >= best_neighbor_utility:
                 retained.add(i)
 
         return retained
@@ -105,13 +160,36 @@ class ICRAClusterer:
         remaining = [i for i in alive.keys() if i not in covered]
 
         while remaining:
-            best = max(remaining, key=lambda i: (alive[i].utility, -i))
+            best = max(
+                remaining,
+                key=lambda i: (
+                    alive[i].utility,
+                    alive[i].s4,
+                    alive[i].s1,
+                    -i,
+                ),
+            )
             chs.add(best)
             newly_covered = {best}
             newly_covered.update(_alive_neighbors(alive[best], alive))
             remaining = [i for i in remaining if i not in newly_covered]
 
         return chs
+
+    def _ch_connectivity_score(self, ch_id: int, candidate_members: List[int], alive: Dict[int, Node]) -> float:
+        ch_node = alive[ch_id]
+        score = 0.0
+
+        strong_neighbor_count = 0
+        for j in _alive_neighbors(ch_node, alive):
+            lht = link_holding_time_s(ch_node, alive[j], self.comm_radius_m)
+            if lht >= self.min_gateway_lht_s:
+                strong_neighbor_count += 1
+                score += min(lht, 10.0) / 10.0
+
+        score += min(len(candidate_members), 4) * 0.08
+        score += min(strong_neighbor_count, 4) * 0.10
+        return score
 
     def _best_candidate_ch(
         self,
@@ -121,7 +199,7 @@ class ICRAClusterer:
         current_ch: Optional[int],
         clusters: Dict[int, List[int]],
     ) -> Optional[int]:
-        candidates: List[Tuple[float, float, int]] = []
+        candidates: List[Tuple[float, float, float, int]] = []
 
         for ch in chs:
             if ch == node.node_id:
@@ -136,18 +214,24 @@ class ICRAClusterer:
             if len(clusters.get(ch, [])) >= self.max_cluster_members + 1:
                 continue
 
-            candidates.append((ch_node.utility, lht, ch))
+            projected_members = list(clusters.get(ch, [])) + [node.node_id]
+            conn_score = self._ch_connectivity_score(ch, projected_members, alive)
+            score = ch_node.utility + 0.20 * min(lht, 5.0) / 5.0 + 0.20 * conn_score
+            candidates.append((score, ch_node.utility, lht, ch))
 
         if not candidates:
             return None
 
         candidates.sort(reverse=True)
-        best_score, _, best_ch = candidates[0]
+        best_score, _, _, best_ch = candidates[0]
 
         if current_ch is not None and current_ch in alive and current_ch in chs:
             if current_ch in _alive_neighbors(node, alive):
                 old_lht = link_holding_time_s(node, alive[current_ch], self.comm_radius_m)
-                old_score = alive[current_ch].utility
+                projected_members = list(clusters.get(current_ch, []))
+                old_conn = self._ch_connectivity_score(current_ch, projected_members, alive)
+                old_score = alive[current_ch].utility + 0.20 * min(old_lht, 5.0) / 5.0 + 0.20 * old_conn
+
                 if old_lht >= self.lht_threshold_s and old_score + self.join_hysteresis_margin >= best_score:
                     return current_ch
 
@@ -155,16 +239,19 @@ class ICRAClusterer:
 
     def _assign_members_with_retention(
         self,
-        nodes: Dict[int, Node],
         alive: Dict[int, Node],
         chs: Set[int],
     ) -> Dict[int, List[int]]:
         clusters: Dict[int, List[int]] = {ch: [ch] for ch in chs}
 
-        for i, node in alive.items():
-            if i in chs:
-                continue
+        non_ch_nodes = sorted(
+            [i for i in alive.keys() if i not in chs],
+            key=lambda i: (alive[i].s4, alive[i].utility),
+            reverse=True,
+        )
 
+        for i in non_ch_nodes:
+            node = alive[i]
             current_ch = node.cluster_head if node.cluster_head in chs else None
             chosen = self._best_candidate_ch(
                 node=node,
@@ -185,83 +272,294 @@ class ICRAClusterer:
 
         return clusters
 
+    def _ch_direct_neighbors(self, chs: List[int], alive: Dict[int, Node]) -> Dict[int, Set[int]]:
+        graph: Dict[int, Set[int]] = {ch: set() for ch in chs}
+        for i, ch_a in enumerate(chs):
+            for ch_b in chs[i + 1 :]:
+                if ch_b in _alive_neighbors(alive[ch_a], alive):
+                    lht = link_holding_time_s(alive[ch_a], alive[ch_b], self.comm_radius_m)
+                    if lht >= self.min_gateway_lht_s:
+                        graph[ch_a].add(ch_b)
+                        graph[ch_b].add(ch_a)
+        return graph
+
+    def _reachable_other_chs_for_member(
+        self,
+        node_id: int,
+        own_ch: int,
+        clusters: Dict[int, List[int]],
+        alive: Dict[int, Node],
+    ) -> Set[int]:
+        node = alive[node_id]
+        if own_ch not in _alive_neighbors(node, alive):
+            return set()
+
+        lht_to_ch = link_holding_time_s(node, alive[own_ch], self.comm_radius_m)
+        if lht_to_ch < self.min_gateway_lht_s:
+            return set()
+
+        reachable: Set[int] = set()
+        for other_ch, members in clusters.items():
+            if other_ch == own_ch:
+                continue
+
+            if other_ch in _alive_neighbors(node, alive):
+                lht = link_holding_time_s(node, alive[other_ch], self.comm_radius_m)
+                if lht >= self.min_gateway_lht_s:
+                    reachable.add(other_ch)
+                    continue
+
+            for v in members:
+                if v == node_id:
+                    continue
+                if v not in _alive_neighbors(node, alive):
+                    continue
+                lht = link_holding_time_s(node, alive[v], self.comm_radius_m)
+                if lht >= self.min_gateway_lht_s:
+                    reachable.add(other_ch)
+                    break
+
+        return reachable
+
+    def _gateway_candidate_score(
+        self,
+        node_id: int,
+        own_ch: int,
+        reachable_chs: Set[int],
+        alive: Dict[int, Node],
+        old_forwarders: Set[int],
+    ) -> float:
+        node = alive[node_id]
+        lht_to_ch = link_holding_time_s(node, alive[own_ch], self.comm_radius_m)
+        stability_term = min(getattr(node, "time_in_cluster_s", 0.0), 20.0) / 20.0
+        best_cross = 0.0
+
+        for other_ch in reachable_chs:
+            if other_ch in _alive_neighbors(node, alive):
+                lht = link_holding_time_s(node, alive[other_ch], self.comm_radius_m)
+                best_cross = max(best_cross, lht)
+
+        score = (
+            self.gateway_crosslink_weight * min(best_cross, 10.0) / 10.0
+            + self.gateway_utility_weight * node.utility
+            + self.gateway_energy_weight * node.s1
+            + self.gateway_stability_weight * stability_term
+            + self.gateway_multicluster_bonus * min(len(reachable_chs), 3)
+            + 0.05 * min(lht_to_ch, 5.0) / 5.0
+        )
+
+        if node_id in old_forwarders:
+            score += self.forwarder_reuse_bonus
+
+        return score
+
+    def _build_gateway_candidates(
+        self,
+        nodes: Dict[int, Node],
+        alive: Dict[int, Node],
+        clusters: Dict[int, List[int]],
+    ) -> List[GatewayCandidate]:
+        old_forwarders = {
+            i for i, n in nodes.items()
+            if n.e_j > 0 and n.role == Role.FORWARDER
+        }
+
+        candidates: List[GatewayCandidate] = []
+
+        for own_ch, members in clusters.items():
+            for node_id in members:
+                if node_id == own_ch:
+                    continue
+
+                reachable_chs = self._reachable_other_chs_for_member(
+                    node_id=node_id,
+                    own_ch=own_ch,
+                    clusters=clusters,
+                    alive=alive,
+                )
+                if not reachable_chs:
+                    continue
+
+                score = self._gateway_candidate_score(
+                    node_id=node_id,
+                    own_ch=own_ch,
+                    reachable_chs=reachable_chs,
+                    alive=alive,
+                    old_forwarders=old_forwarders,
+                )
+
+                candidates.append(
+                    GatewayCandidate(
+                        node_id=node_id,
+                        own_ch=own_ch,
+                        reachable_chs=tuple(sorted(reachable_chs)),
+                        score=score,
+                    )
+                )
+
+        return candidates
+
+    def _components(self, chs: List[int], graph: Dict[int, Set[int]]) -> List[Set[int]]:
+        seen: Set[int] = set()
+        comps: List[Set[int]] = []
+
+        for ch in chs:
+            if ch in seen:
+                continue
+            stack = [ch]
+            comp: Set[int] = set()
+            seen.add(ch)
+            while stack:
+                u = stack.pop()
+                comp.add(u)
+                for v in graph.get(u, set()):
+                    if v not in seen:
+                        seen.add(v)
+                        stack.append(v)
+            comps.append(comp)
+
+        return comps
+
+    def _graph_with_candidate(
+        self,
+        graph: Dict[int, Set[int]],
+        candidate: GatewayCandidate,
+    ) -> Dict[int, Set[int]]:
+        new_graph = {k: set(v) for k, v in graph.items()}
+        for other_ch in candidate.reachable_chs:
+            if other_ch == candidate.own_ch:
+                continue
+            new_graph.setdefault(candidate.own_ch, set()).add(other_ch)
+            new_graph.setdefault(other_ch, set()).add(candidate.own_ch)
+        return new_graph
+
     def _select_forwarders(
         self,
         nodes: Dict[int, Node],
         alive: Dict[int, Node],
         clusters: Dict[int, List[int]],
     ) -> Set[int]:
+        chs = sorted(clusters.keys())
+        if not chs:
+            return set()
+
+        direct_graph = self._ch_direct_neighbors(chs, alive)
+        graph = {k: set(v) for k, v in direct_graph.items()}
+
         old_forwarders = {
             i for i, n in nodes.items()
             if n.e_j > 0 and n.role == Role.FORWARDER
         }
 
-        forwarders: Set[int] = set()
-        chs = list(clusters.keys())
+        selected: Set[int] = set()
+        used_chs: Set[int] = set()
+        candidates = self._build_gateway_candidates(nodes, alive, clusters)
 
-        for ch_a in chs:
-            for ch_b in chs:
-                if ch_a >= ch_b:
+        # Greedy coverage:
+        # choose gateways that reduce CH connected components the most,
+        # then prefer ones that connect to many distinct CHs, then score.
+        while True:
+            cur_components = self._components(chs, graph)
+            cur_count = len(cur_components)
+
+            best_pick: Optional[Tuple[int, int, float, GatewayCandidate]] = None
+
+            for cand in candidates:
+                if cand.node_id in selected:
                     continue
 
-                candidates_a: List[Tuple[float, int]] = []
-                candidates_b: List[Tuple[float, int]] = []
+                # keep at most one primary forwarder per cluster in greedy pass
+                if cand.own_ch in used_chs:
+                    continue
 
-                for u in clusters[ch_a]:
-                    if u == ch_a:
-                        continue
-                    if ch_a not in _alive_neighbors(alive[u], alive):
-                        continue
+                new_graph = self._graph_with_candidate(graph, cand)
+                new_components = self._components(chs, new_graph)
+                new_count = len(new_components)
 
-                    lht_ua = link_holding_time_s(alive[u], alive[ch_a], self.comm_radius_m)
-                    if lht_ua < self.min_gateway_lht_s:
-                        continue
+                component_gain = cur_count - new_count
+                new_neighbors = len(set(cand.reachable_chs) - graph.get(cand.own_ch, set()))
+                score = cand.score
 
-                    best_cross = 0.0
-                    for v in clusters[ch_b]:
-                        if v not in _alive_neighbors(alive[u], alive):
-                            continue
-                        lht_uv = link_holding_time_s(alive[u], alive[v], self.comm_radius_m)
-                        best_cross = max(best_cross, lht_uv)
+                key = (component_gain, new_neighbors, score, cand)
+                if best_pick is None or (component_gain, new_neighbors, score) > (
+                    best_pick[0],
+                    best_pick[1],
+                    best_pick[2],
+                ):
+                    best_pick = key
 
-                    if best_cross >= self.min_gateway_lht_s:
-                        score = 0.55 * best_cross + 0.35 * alive[u].utility + 0.10 * alive[u].s1
-                        if u in old_forwarders:
-                            score += 0.05
-                        candidates_a.append((score, u))
+            if best_pick is None:
+                break
 
-                for v in clusters[ch_b]:
-                    if v == ch_b:
-                        continue
-                    if ch_b not in _alive_neighbors(alive[v], alive):
-                        continue
+            component_gain, new_neighbors, _, cand = best_pick
+            if component_gain <= 0 and new_neighbors <= 0:
+                break
 
-                    lht_vb = link_holding_time_s(alive[v], alive[ch_b], self.comm_radius_m)
-                    if lht_vb < self.min_gateway_lht_s:
-                        continue
+            selected.add(cand.node_id)
+            used_chs.add(cand.own_ch)
+            graph = self._graph_with_candidate(graph, cand)
 
-                    best_cross = 0.0
-                    for u in clusters[ch_a]:
-                        if u not in _alive_neighbors(alive[v], alive):
-                            continue
-                        lht_vu = link_holding_time_s(alive[v], alive[u], self.comm_radius_m)
-                        best_cross = max(best_cross, lht_vu)
+        # Fallback pass:
+        # any CH still isolated in the CH graph gets its best available gateway.
+        comps = self._components(chs, graph)
+        isolated_or_weak = {
+            ch for comp in comps for ch in comp if len(comp) == 1 and len(graph.get(ch, set())) == 0
+        }
 
-                    if best_cross >= self.min_gateway_lht_s:
-                        score = 0.55 * best_cross + 0.35 * alive[v].utility + 0.10 * alive[v].s1
-                        if v in old_forwarders:
-                            score += 0.05
-                        candidates_b.append((score, v))
+        for ch in chs:
+            if ch not in isolated_or_weak:
+                continue
 
-                if candidates_a:
-                    candidates_a.sort(reverse=True)
-                    forwarders.add(candidates_a[0][1])
+            best_fallback: Optional[Tuple[float, GatewayCandidate]] = None
+            for cand in candidates:
+                if cand.own_ch != ch:
+                    continue
+                if cand.node_id in selected:
+                    continue
 
-                if candidates_b:
-                    candidates_b.sort(reverse=True)
-                    forwarders.add(candidates_b[0][1])
+                new_neighbors = len(set(cand.reachable_chs) - graph.get(ch, set()))
+                if new_neighbors <= 0:
+                    continue
 
-        return forwarders
+                fallback_score = cand.score + 0.15 * new_neighbors
+                if best_fallback is None or fallback_score > best_fallback[0]:
+                    best_fallback = (fallback_score, cand)
+
+            if best_fallback is not None:
+                cand = best_fallback[1]
+                selected.add(cand.node_id)
+                graph = self._graph_with_candidate(graph, cand)
+
+        # Optional reuse pass:
+        # allow one extra reusable gateway if a CH still has only one neighbor and there is
+        # an old forwarder that expands coverage.
+        for ch in chs:
+            if len(graph.get(ch, set())) >= 2:
+                continue
+
+            best_extra: Optional[Tuple[float, GatewayCandidate]] = None
+            for cand in candidates:
+                if cand.own_ch != ch:
+                    continue
+                if cand.node_id in selected:
+                    continue
+                if cand.node_id not in old_forwarders:
+                    continue
+
+                new_neighbors = len(set(cand.reachable_chs) - graph.get(ch, set()))
+                if new_neighbors <= 0:
+                    continue
+
+                extra_score = cand.score + 0.20 * new_neighbors
+                if best_extra is None or extra_score > best_extra[0]:
+                    best_extra = (extra_score, cand)
+
+            if best_extra is not None:
+                cand = best_extra[1]
+                selected.add(cand.node_id)
+                graph = self._graph_with_candidate(graph, cand)
+
+        return selected
 
     def _apply_roles(
         self,
@@ -333,10 +631,12 @@ class ICRAClusterer:
         if not factors_already_set:
             self._ensure_factors(alive)
 
-        self._compute_utilities(alive, weights)
+        self._compute_base_utilities(alive, weights)
+        self._apply_connectivity_bonus(alive)
+
         retained = self._retain_existing_chs(alive)
         chs = self._elect_new_chs(alive, retained)
-        clusters = self._assign_members_with_retention(nodes, alive, chs)
+        clusters = self._assign_members_with_retention(alive, chs)
         forwarders = self._select_forwarders(nodes, alive, clusters)
         self._apply_roles(nodes, clusters, forwarders, dt_s=dt_s)
 

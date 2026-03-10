@@ -13,7 +13,7 @@ class SimConfig:
     sim_time_s: int = 1500
     dt_s: float = 1.0
 
-    # slower re-clustering to reduce role churn
+    # stabilized re-clustering period
     clustering_interval_s: int = 5
 
     # area and radio
@@ -37,7 +37,6 @@ class SimConfig:
     # energy
     ehf_j_per_s: float = 2.0
     en_j_per_s: float = 1.0
-
     e_tx_j: float = 0.05
     e_rx_j: float = 0.02
     e_ch_proc_j: float = 0.008
@@ -52,12 +51,28 @@ class SimConfig:
     lht_threshold_s: float = 0.20
     lht_cap_s: float = 60.0
 
-    # stronger retention
+    # retention / hysteresis
     join_hysteresis_margin: float = 0.08
     ch_retain_margin: float = 0.10
     min_ch_tenure_s: float = 12.0
     max_cluster_members: int = 18
-    min_gateway_lht_s: float = 0.25
+
+    # slightly relaxed so the gateway layer can connect more CHs
+    min_gateway_lht_s: float = 0.18
+
+    # connectivity-aware CH scoring
+    min_ch_neighbor_count: int = 1
+    prefer_connected_ch_bonus: float = 0.10
+    isolated_ch_penalty: float = 0.12
+
+    # forwarder / gateway selection
+    forwarder_reuse_bonus: float = 0.07
+    gateway_crosslink_weight: float = 0.50
+    gateway_utility_weight: float = 0.18
+    gateway_energy_weight: float = 0.12
+    gateway_stability_weight: float = 0.10
+    gateway_multicluster_bonus: float = 0.10
+    direct_ch_link_bonus: float = 0.08
 
     # RL
     reward_lambda: float = 0.50
