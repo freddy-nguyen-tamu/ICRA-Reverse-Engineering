@@ -1,13 +1,6 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
 import argparse
 import csv
 from pathlib import Path
@@ -15,8 +8,14 @@ from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
 from icra_sim.config import ProtocolName, ScenarioConfig, ScenarioName, SimConfig
 from icra_sim.simulator import run_simulation
+
 
 def save_csv(path: Path, rows: List[Dict]) -> None:
     if not rows:
@@ -111,7 +110,7 @@ def main() -> None:
     icra_weight_summary: Dict[str, Tuple[float, float, float, float]] = {}
 
     for scen in scenarios:
-        scen_cfg = ScenarioConfig.for_scenario(scen)
+        scen_cfg = ScenarioConfig.from_name(scen)
 
         series_cluster_cost: Dict[str, Dict[int, float]] = {p: {} for p in protocols}
         series_role_changes: Dict[str, Dict[int, float]] = {p: {} for p in protocols}
@@ -123,21 +122,28 @@ def main() -> None:
         for n in Ns:
             for proto in protocols:
                 print(f"Running: scenario={scen} N={n} protocol={proto}")
-                res = run_simulation(protocol=proto, scenario=scen_cfg, n_nodes=n, cfg=cfg)
+                res = run_simulation(
+                    protocol=proto,
+                    scenario_cfg=scen_cfg,
+                    n_nodes=n,
+                    cfg=cfg,
+                )
                 m = res.metrics
 
-                metrics_rows.append({
-                    "scenario": scen,
-                    "N": n,
-                    "protocol": proto,
-                    "cluster_protocol_cost_s": m.cluster_creation_time_s,
-                    "avg_role_changes": m.avg_role_changes,
-                    "network_lifetime_s": m.network_lifetime_s,
-                    "dead_nodes": m.dead_nodes,
-                    "isolation_clusters_avg": m.isolation_clusters,
-                    "avg_end_to_end_delay_s": m.avg_end_to_end_delay_s,
-                    "packet_delivery_ratio": m.packet_delivery_ratio,
-                })
+                metrics_rows.append(
+                    {
+                        "scenario": scen,
+                        "N": n,
+                        "protocol": proto,
+                        "cluster_protocol_cost_s": m.cluster_creation_time_s,
+                        "avg_role_changes": m.avg_role_changes,
+                        "network_lifetime_s": m.network_lifetime_s,
+                        "dead_nodes": m.dead_nodes,
+                        "isolation_clusters_avg": m.isolation_clusters,
+                        "avg_end_to_end_delay_s": m.avg_end_to_end_delay_s,
+                        "packet_delivery_ratio": m.packet_delivery_ratio,
+                    }
+                )
 
                 series_cluster_cost[proto][n] = m.cluster_creation_time_s
                 series_role_changes[proto][n] = m.avg_role_changes
@@ -170,11 +176,46 @@ def main() -> None:
             series_cluster_cost,
             f"cluster_cost_{scen}.png",
         )
-        plot_metric_vs_n(out_dir, f"Avg role changes vs N ({scen})", "Number of nodes (N)", "Avg role changes per node", series_role_changes, f"role_changes_{scen}.png")
-        plot_metric_vs_n(out_dir, f"Network lifetime vs N ({scen})", "Number of nodes (N)", "First-dead time (s)", series_lifetime, f"lifetime_{scen}.png")
-        plot_metric_vs_n(out_dir, f"Isolation clusters (avg) vs N ({scen})", "Number of nodes (N)", "Isolation clusters (avg)", series_iso, f"isolation_{scen}.png")
-        plot_metric_vs_n(out_dir, f"End-to-end delay vs N ({scen})", "Number of nodes (N)", "Avg delay (s)", series_delay, f"delay_{scen}.png")
-        plot_metric_vs_n(out_dir, f"Packet delivery ratio vs N ({scen})", "Number of nodes (N)", "PDR", series_pdr, f"pdr_{scen}.png")
+        plot_metric_vs_n(
+            out_dir,
+            f"Avg role changes vs N ({scen})",
+            "Number of nodes (N)",
+            "Avg role changes per node",
+            series_role_changes,
+            f"role_changes_{scen}.png",
+        )
+        plot_metric_vs_n(
+            out_dir,
+            f"Network lifetime vs N ({scen})",
+            "Number of nodes (N)",
+            "First-dead time (s)",
+            series_lifetime,
+            f"lifetime_{scen}.png",
+        )
+        plot_metric_vs_n(
+            out_dir,
+            f"Isolation clusters (avg) vs N ({scen})",
+            "Number of nodes (N)",
+            "Isolation clusters (avg)",
+            series_iso,
+            f"isolation_{scen}.png",
+        )
+        plot_metric_vs_n(
+            out_dir,
+            f"End-to-end delay vs N ({scen})",
+            "Number of nodes (N)",
+            "Avg delay (s)",
+            series_delay,
+            f"delay_{scen}.png",
+        )
+        plot_metric_vs_n(
+            out_dir,
+            f"Packet delivery ratio vs N ({scen})",
+            "Number of nodes (N)",
+            "PDR",
+            series_pdr,
+            f"pdr_{scen}.png",
+        )
 
     save_csv(out_dir / "metrics.csv", metrics_rows)
 

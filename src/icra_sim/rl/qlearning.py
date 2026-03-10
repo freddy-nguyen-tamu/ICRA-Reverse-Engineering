@@ -12,8 +12,10 @@ State = Tuple[float, float, float, float]
 Action = Tuple[float, float, float, float]
 
 
-def generate_action_space(step: float = 0.05) -> List[Action]:
-    """Generate all 4-tuples of weights in increments of `step` that sum to 1."""
+def generate_action_space(step: float = 0.10) -> List[Action]:
+    """
+    Generate all 4-tuples of weights in increments of `step` that sum to 1.
+    """
     denom = int(round(1.0 / step))
     total = denom
     actions: List[Action] = []
@@ -26,7 +28,6 @@ def generate_action_space(step: float = 0.05) -> List[Action]:
 
 
 def entropy_from_values(values: List[float]) -> float:
-    """Entropy over values quantized to {0.0, 0.1, ..., 1.0}."""
     if not values:
         return 0.0
     bins = [0] * 11
@@ -45,11 +46,12 @@ def entropy_from_values(values: List[float]) -> float:
 
 def network_state(nodes: Dict[int, Node]) -> State:
     """
-    Paper-like state:
-    normalize factor entropy by log(11), then quantize to 0.1 resolution.
+    State derived from factor dispersion / entropy.
     """
     Hmax = math.log(11.0)
     alive = [n for n in nodes.values() if n.e_j > 0]
+    if not alive:
+        return (0.0, 0.0, 0.0, 0.0)
 
     s1_vals = [n.s1 for n in alive]
     s2_vals = [n.s2 for n in alive]
@@ -58,7 +60,7 @@ def network_state(nodes: Dict[int, Node]) -> State:
 
     def norm_round(H: float) -> float:
         x = 0.0 if Hmax <= 0 else clamp(H / Hmax, 0.0, 1.0)
-        return round(x * 10.0) / 10.0
+        return round(x, 1)
 
     return (
         norm_round(entropy_from_values(s1_vals)),
@@ -69,40 +71,49 @@ def network_state(nodes: Dict[int, Node]) -> State:
 
 
 def reward_transform(r: float) -> float:
-    """Paper Eq.(22)-style transform."""
-    if abs(r - 1.0) < 1e-12:
-        return 1.0
-    if abs(r + 1.0) < 1e-12:
-        return -1.0
-    return (1.0 - math.exp(-3.0 * r)) / (1.0 + math.exp(-3.0 * r))
+    """
+    Smooth monotonic transform from [-1, 1] to roughly [-1, 1].
+    """
+    r = clamp(r, -1.0, 1.0)
+    return math.tanh(2.5 * r)
 
 
 @dataclass
 class QLearningStrategy:
     actions: List[Action]
-    alpha: float = 0.8
-    gamma: float = 0.0
+    alpha: float = 0.35
+    gamma: float = 0.80
     default_action: Action = (0.25, 0.25, 0.25, 0.25)
 
-    epsilon: float = 0.20
-    epsilon_min: float = 0.02
-    epsilon_decay: float = 0.999
+    epsilon: float = 0.18
+    epsilon_min: float = 0.03
+    epsilon_decay: float = 0.992
 
+    optimistic_init: float = 0.15
     Q: Dict[State, Dict[Action, float]] = field(default_factory=dict)
 
     def get_q(self, s: State, a: Action) -> float:
         if s not in self.Q:
             self.Q[s] = {}
-        if a in self.Q[s]:
-            return self.Q[s][a]
-        return 1.0 if a == self.default_action else 0.0
+        return self.Q[s].get(a, self.optimistic_init)
 
     def set_q(self, s: State, a: Action, v: float) -> None:
         self.Q.setdefault(s, {})[a] = v
 
+    def best_action_value(self, s: State) -> float:
+        if not self.actions:
+            return 0.0
+        return max(self.get_q(s, a) for a in self.actions)
+
     def select_action(self, s: State) -> Action:
+        if not self.actions:
+            return self.default_action
+
         if random.random() < self.epsilon:
-            return random.choice(self.actions)
+            # biased exploration: favor non-uniform actions a bit
+            non_uniform = [a for a in self.actions if a != self.default_action]
+            pool = non_uniform if non_uniform and random.random() < 0.70 else self.actions
+            return random.choice(pool)
 
         best_val = -1e18
         best_actions: List[Action] = []
@@ -114,11 +125,20 @@ class QLearningStrategy:
             elif abs(q - best_val) < 1e-12:
                 best_actions.append(a)
 
-        return random.choice(best_actions) if best_actions else self.default_action
+        if not best_actions:
+            return self.default_action
 
-    def update(self, s: State, a: Action, reward: float) -> None:
+        # prefer more decisive actions among ties
+        def peakedness(a: Action) -> float:
+            return max(a) - min(a)
+
+        best_actions.sort(key=peakedness, reverse=True)
+        top = [a for a in best_actions if abs(peakedness(a) - peakedness(best_actions[0])) < 1e-12]
+        return random.choice(top)
+
+    def update(self, s: State, a: Action, reward: float, s_next: State) -> None:
         old = self.get_q(s, a)
-        target = reward
-        new = self.alpha * target + (1.0 - self.alpha) * old
+        target = reward + self.gamma * self.best_action_value(s_next)
+        new = old + self.alpha * (target - old)
         self.set_q(s, a, new)
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
