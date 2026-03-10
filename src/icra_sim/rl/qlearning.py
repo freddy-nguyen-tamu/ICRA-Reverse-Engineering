@@ -2,139 +2,185 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from collections import Counter
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..node import Node
-from ..utils import clamp, safe_log
+from ..utils import clamp
 
-State = Tuple[float, float, float, float]
 Action = Tuple[float, float, float, float]
+State = Tuple[float, float, float, float]
 
 
-def generate_action_space(step: float = 0.10) -> List[Action]:
-    """
-    Generate all 4-tuples of weights in increments of `step` that sum to 1.
-    """
-    denom = int(round(1.0 / step))
-    total = denom
-    actions: List[Action] = []
-    for a in range(total + 1):
-        for b in range(total - a + 1):
-            for c in range(total - a - b + 1):
-                d = total - a - b - c
-                actions.append((a * step, b * step, c * step, d * step))
-    return actions
+def _quantize_tenth(x: float) -> float:
+    return round(clamp(round(x * 10.0) / 10.0, 0.0, 1.0), 1)
 
 
-def entropy_from_values(values: List[float]) -> float:
-    if not values:
+def _entropy_from_values(values: Iterable[float]) -> float:
+    vals = [_quantize_tenth(v) for v in values]
+    if not vals:
         return 0.0
-    bins = [0] * 11
-    for v in values:
-        q = int(round(clamp(v, 0.0, 1.0) * 10))
-        bins[q] += 1
-    n = len(values)
-    H = 0.0
-    for count in bins:
-        if count == 0:
-            continue
-        p = count / n
-        H -= p * safe_log(p)
-    return H
+    c = Counter(vals)
+    total = len(vals)
+    h = 0.0
+    for count in c.values():
+        p = count / total
+        if p > 0:
+            h -= p * math.log(p)
+    return _quantize_tenth(min(1.0, h))
 
 
 def network_state(nodes: Dict[int, Node]) -> State:
-    """
-    State derived from factor dispersion / entropy.
-    """
-    Hmax = math.log(11.0)
     alive = [n for n in nodes.values() if n.e_j > 0]
     if not alive:
         return (0.0, 0.0, 0.0, 0.0)
 
-    s1_vals = [n.s1 for n in alive]
-    s2_vals = [n.s2 for n in alive]
-    s3_vals = [n.s3 for n in alive]
-    s4_vals = [n.s4 for n in alive]
-
-    def norm_round(H: float) -> float:
-        x = 0.0 if Hmax <= 0 else clamp(H / Hmax, 0.0, 1.0)
-        return round(x, 1)
-
     return (
-        norm_round(entropy_from_values(s1_vals)),
-        norm_round(entropy_from_values(s2_vals)),
-        norm_round(entropy_from_values(s3_vals)),
-        norm_round(entropy_from_values(s4_vals)),
+        _entropy_from_values(n.s1 for n in alive),
+        _entropy_from_values(n.s2 for n in alive),
+        _entropy_from_values(n.s3 for n in alive),
+        _entropy_from_values(n.s4 for n in alive),
     )
 
 
+def generate_action_space(step: float = 0.05) -> List[Action]:
+    step_units = int(round(1.0 / step))
+    actions: List[Action] = []
+    for a in range(step_units + 1):
+        for b in range(step_units + 1 - a):
+            for c in range(step_units + 1 - a - b):
+                d = step_units - a - b - c
+                action = (
+                    round(a * step, 10),
+                    round(b * step, 10),
+                    round(c * step, 10),
+                    round(d * step, 10),
+                )
+                actions.append(action)
+    actions.sort()
+    return actions
+
+
 def reward_transform(r: float) -> float:
-    """
-    Smooth monotonic transform from [-1, 1] to roughly [-1, 1].
-    """
-    r = clamp(r, -1.0, 1.0)
-    return math.tanh(2.5 * r)
+    return clamp(r, -1.0, 1.0)
 
 
-@dataclass
+def smooth_action(
+    prev_action: Optional[Action],
+    raw_action: Action,
+    beta: float,
+) -> Action:
+    if prev_action is None:
+        return raw_action
+
+    smoothed = tuple(
+        beta * prev_action[i] + (1.0 - beta) * raw_action[i]
+        for i in range(4)
+    )
+    total = sum(smoothed)
+    if total <= 0:
+        return (0.25, 0.25, 0.25, 0.25)
+
+    normalized = tuple(x / total for x in smoothed)
+
+    snapped = tuple(round(x / 0.05) * 0.05 for x in normalized)
+    total2 = sum(snapped)
+    if total2 <= 0:
+        return (0.25, 0.25, 0.25, 0.25)
+
+    fixed = [x / total2 for x in snapped]
+    fixed = [round(x, 10) for x in fixed]
+
+    diff = round(1.0 - sum(fixed), 10)
+    if abs(diff) > 1e-12:
+        idx = max(range(4), key=lambda i: fixed[i])
+        fixed[idx] = round(fixed[idx] + diff, 10)
+
+    return (fixed[0], fixed[1], fixed[2], fixed[3])
+
+
 class QLearningStrategy:
-    actions: List[Action]
-    alpha: float = 0.35
-    gamma: float = 0.80
-    default_action: Action = (0.25, 0.25, 0.25, 0.25)
+    def __init__(
+        self,
+        actions: List[Action],
+        alpha: float,
+        gamma: float,
+        epsilon: float,
+        epsilon_min: float,
+        epsilon_decay: float,
+        stickiness_bonus: float = 0.08,
+        min_action_hold_rounds: int = 6,
+        allow_action_jump_l1: float = 0.40,
+    ) -> None:
+        self.actions = actions
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
 
-    epsilon: float = 0.18
-    epsilon_min: float = 0.03
-    epsilon_decay: float = 0.992
+        self.stickiness_bonus = stickiness_bonus
+        self.min_action_hold_rounds = min_action_hold_rounds
+        self.allow_action_jump_l1 = allow_action_jump_l1
 
-    optimistic_init: float = 0.15
-    Q: Dict[State, Dict[Action, float]] = field(default_factory=dict)
+        self.q: Dict[Tuple[State, Action], float] = {}
+        self.default_action: Action = (0.25, 0.25, 0.25, 0.25)
+
+        self.last_action: Optional[Action] = None
+        self.last_action_rounds: int = 0
 
     def get_q(self, s: State, a: Action) -> float:
-        if s not in self.Q:
-            self.Q[s] = {}
-        return self.Q[s].get(a, self.optimistic_init)
+        return self.q.get((s, a), 0.0)
 
     def set_q(self, s: State, a: Action, v: float) -> None:
-        self.Q.setdefault(s, {})[a] = v
+        self.q[(s, a)] = v
 
     def best_action_value(self, s: State) -> float:
-        if not self.actions:
-            return 0.0
         return max(self.get_q(s, a) for a in self.actions)
 
+    def _action_distance(self, a: Action, b: Action) -> float:
+        return sum(abs(a[i] - b[i]) for i in range(4))
+
+    def _eligible_actions(self) -> List[Action]:
+        if self.last_action is None:
+            return self.actions
+
+        eligible = [
+            a for a in self.actions
+            if self._action_distance(a, self.last_action) <= self.allow_action_jump_l1 + 1e-12
+        ]
+        return eligible if eligible else self.actions
+
     def select_action(self, s: State) -> Action:
-        if not self.actions:
-            return self.default_action
+        if self.last_action is not None and self.last_action_rounds < self.min_action_hold_rounds:
+            self.last_action_rounds += 1
+            return self.last_action
+
+        candidates = self._eligible_actions()
 
         if random.random() < self.epsilon:
-            # biased exploration: favor non-uniform actions a bit
-            non_uniform = [a for a in self.actions if a != self.default_action]
-            pool = non_uniform if non_uniform and random.random() < 0.70 else self.actions
-            return random.choice(pool)
+            chosen = random.choice(candidates)
+        else:
+            scored: List[Tuple[float, Action]] = []
+            for a in candidates:
+                q = self.get_q(s, a)
+                if self.last_action is not None and a == self.last_action:
+                    q += self.stickiness_bonus
+                if a == self.default_action:
+                    q += 0.01
+                scored.append((q, a))
 
-        best_val = -1e18
-        best_actions: List[Action] = []
-        for a in self.actions:
-            q = self.get_q(s, a)
-            if q > best_val + 1e-12:
-                best_val = q
-                best_actions = [a]
-            elif abs(q - best_val) < 1e-12:
-                best_actions.append(a)
+            best_q = max(q for q, _ in scored)
+            best_actions = [a for q, a in scored if abs(q - best_q) < 1e-12]
+            chosen = random.choice(best_actions)
 
-        if not best_actions:
-            return self.default_action
+        if chosen == self.last_action:
+            self.last_action_rounds += 1
+        else:
+            self.last_action = chosen
+            self.last_action_rounds = 1
 
-        # prefer more decisive actions among ties
-        def peakedness(a: Action) -> float:
-            return max(a) - min(a)
-
-        best_actions.sort(key=peakedness, reverse=True)
-        top = [a for a in best_actions if abs(peakedness(a) - peakedness(best_actions[0])) < 1e-12]
-        return random.choice(top)
+        return chosen
 
     def update(self, s: State, a: Action, reward: float, s_next: State) -> None:
         old = self.get_q(s, a)

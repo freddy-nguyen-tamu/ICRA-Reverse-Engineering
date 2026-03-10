@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..node import Node, Role
 
@@ -38,117 +38,66 @@ class Router:
         self.queueing_delay_s = queueing_delay_s
         self.max_hops = max_hops
 
-    def _hop_delay(self) -> float:
+    def _hop_delay(self, backbone: bool = False) -> float:
         tx = self.packet_size_bits / max(1.0, self.data_rate_bps)
-        return tx + self.per_hop_processing_delay_s + self.mac_contention_delay_s + self.queueing_delay_s
-
-    def route_packet(self, nodes: Dict[int, Node], src: int, dst: int) -> PacketResult:
-        if src not in nodes or dst not in nodes:
-            return PacketResult(False, 0, 0.0, tuple())
-
-        if nodes[src].e_j <= 0 or nodes[dst].e_j <= 0:
-            return PacketResult(False, 0, 0.0, tuple())
-
-        if src == dst:
-            return PacketResult(True, 0, 0.0, (src,))
-
-        src_entry = self._access_point(nodes, src)
-        dst_entry = self._access_point(nodes, dst)
-
-        if src_entry is None or dst_entry is None:
-            return PacketResult(False, 0, 0.0, (src,))
-
-        path: List[int] = [src]
-        hops = 0
-
-        if src != src_entry:
-            if src_entry not in _alive_neighbors(nodes[src], nodes):
-                return PacketResult(False, 0, 0.0, tuple(path))
-            path.append(src_entry)
-            hops += 1
-
-        if src_entry == dst_entry:
-            if dst != dst_entry:
-                if dst not in _alive_neighbors(nodes[dst_entry], nodes):
-                    return PacketResult(False, hops, hops * self._hop_delay(), tuple(path))
-                path.append(dst)
-                hops += 1
-            return PacketResult(True, hops, hops * self._hop_delay(), tuple(path))
-
-        backbone_path = self._shortest_backbone_path(nodes, src_entry, dst_entry)
-        if not backbone_path:
-            return PacketResult(False, hops, hops * self._hop_delay(), tuple(path))
-
-        for u in backbone_path[1:]:
-            path.append(u)
-            hops += 1
-            if hops > self.max_hops:
-                return PacketResult(False, hops, hops * self._hop_delay(), tuple(path))
-
-        if dst != dst_entry:
-            if dst not in _alive_neighbors(nodes[dst_entry], nodes):
-                return PacketResult(False, hops, hops * self._hop_delay(), tuple(path))
-            path.append(dst)
-            hops += 1
-
-        if hops > self.max_hops:
-            return PacketResult(False, hops, hops * self._hop_delay(), tuple(path))
-
-        return PacketResult(True, hops, hops * self._hop_delay(), tuple(path))
+        queue = 0.7 * self.queueing_delay_s if backbone else self.queueing_delay_s
+        return tx + self.per_hop_processing_delay_s + self.mac_contention_delay_s + queue
 
     def _access_point(self, nodes: Dict[int, Node], node_id: int) -> Optional[int]:
+        if node_id not in nodes or nodes[node_id].e_j <= 0:
+            return None
+
         node = nodes[node_id]
         if node.role == Role.CH:
             return node_id
-        if node.cluster_head is None:
-            return None
-        ch = node.cluster_head
-        if ch not in nodes or nodes[ch].e_j <= 0:
-            return None
-        if ch not in _alive_neighbors(node, nodes):
-            return None
-        return ch
+        if node.cluster_head is not None and node.cluster_head in nodes and nodes[node.cluster_head].e_j > 0:
+            return node.cluster_head
+        return None
 
-    def _backbone_nodes(self, nodes: Dict[int, Node]) -> Set[int]:
-        return {
-            i for i, n in nodes.items()
-            if n.e_j > 0 and n.role in (Role.CH, Role.FORWARDER)
-        }
+    def _same_cluster(self, nodes: Dict[int, Node], a: int, b: int) -> bool:
+        na = nodes[a]
+        nb = nodes[b]
+        cha = na.node_id if na.role == Role.CH else na.cluster_head
+        chb = nb.node_id if nb.role == Role.CH else nb.cluster_head
+        return cha is not None and cha == chb
 
-    def _edge_cost(self, nodes: Dict[int, Node], u: int, v: int) -> float:
-        nu = nodes[u]
-        nv = nodes[v]
-        energy_u = nu.e_j / max(1e-9, nu.e0_j)
-        energy_v = nv.e_j / max(1e-9, nv.e0_j)
-        stability = 0.5 * (
-            nu.neighbor_lht.get(v, 0.0) / 60.0 +
-            nv.neighbor_lht.get(u, 0.0) / 60.0
-        )
-        stability = max(0.0, min(1.0, stability))
-        return 1.0 + 0.35 * (1.0 - stability) + 0.15 * (1.0 - min(energy_u, energy_v))
+    def _backbone_neighbors(self, nodes: Dict[int, Node], node_id: int) -> List[int]:
+        node = nodes[node_id]
+        nbrs = _alive_neighbors(node, nodes)
+
+        out: List[int] = []
+        for j in nbrs:
+            other = nodes[j]
+            if node.role == Role.CH:
+                # CH connects to CHs in range and forwarders in its cluster
+                if other.role == Role.CH:
+                    out.append(j)
+                elif other.role == Role.FORWARDER and other.cluster_head == node_id:
+                    out.append(j)
+            elif node.role == Role.FORWARDER:
+                # forwarder connects to its CH and nodes outside its own cluster
+                if node.cluster_head is not None and j == node.cluster_head:
+                    out.append(j)
+                elif other.role in (Role.CH, Role.FORWARDER):
+                    if other.cluster_head != node.cluster_head and other.node_id != node.cluster_head:
+                        out.append(j)
+        return list(dict.fromkeys(out))
 
     def _shortest_backbone_path(self, nodes: Dict[int, Node], src: int, dst: int) -> Optional[List[int]]:
-        backbone = self._backbone_nodes(nodes)
-        if src not in backbone or dst not in backbone:
-            return None
-
         pq: List[Tuple[float, int]] = [(0.0, src)]
         dist: Dict[int, float] = {src: 0.0}
         prev: Dict[int, Optional[int]] = {src: None}
 
         while pq:
-            cur_dist, u = heapq.heappop(pq)
-            if cur_dist > dist.get(u, 1e18):
-                continue
+            cur_d, u = heapq.heappop(pq)
             if u == dst:
                 break
+            if cur_d > dist.get(u, float("inf")):
+                continue
 
-            for v in _alive_neighbors(nodes[u], nodes):
-                if v not in backbone:
-                    continue
-
-                nd = cur_dist + self._edge_cost(nodes, u, v)
-                if nd + 1e-12 < dist.get(v, 1e18):
+            for v in self._backbone_neighbors(nodes, u):
+                nd = cur_d + self._hop_delay(backbone=True)
+                if nd < dist.get(v, float("inf")):
                     dist[v] = nd
                     prev[v] = u
                     heapq.heappush(pq, (nd, v))
@@ -163,3 +112,65 @@ class Router:
             cur = prev.get(cur)
         rev.reverse()
         return rev
+
+    def route_packet(self, nodes: Dict[int, Node], src: int, dst: int) -> PacketResult:
+        if src not in nodes or dst not in nodes:
+            return PacketResult(False, 0, 0.0, tuple())
+        if nodes[src].e_j <= 0 or nodes[dst].e_j <= 0:
+            return PacketResult(False, 0, 0.0, tuple())
+        if src == dst:
+            return PacketResult(True, 0, 0.0, (src,))
+
+        src_ap = self._access_point(nodes, src)
+        dst_ap = self._access_point(nodes, dst)
+        if src_ap is None or dst_ap is None:
+            return PacketResult(False, 0, 0.0, (src,))
+
+        path: List[int] = [src]
+        hops = 0
+        delay_s = 0.0
+
+        # Step 4: member -> CH
+        if src != src_ap:
+            if src_ap not in _alive_neighbors(nodes[src], nodes):
+                return PacketResult(False, 0, 0.0, tuple(path))
+            path.append(src_ap)
+            hops += 1
+            delay_s += self._hop_delay(backbone=False)
+
+        # intra-cluster
+        if self._same_cluster(nodes, src_ap, dst_ap):
+            if dst != src_ap:
+                if dst not in _alive_neighbors(nodes[src_ap], nodes):
+                    return PacketResult(False, hops, delay_s, tuple(path))
+                path.append(dst)
+                hops += 1
+                delay_s += self._hop_delay(backbone=False)
+            if hops > self.max_hops:
+                return PacketResult(False, hops, delay_s, tuple(path))
+            return PacketResult(True, hops, delay_s, tuple(path))
+
+        # inter-cluster: backbone route
+        bb_path = self._shortest_backbone_path(nodes, src_ap, dst_ap)
+        if bb_path is None:
+            return PacketResult(False, hops, delay_s, tuple(path))
+
+        for node_id in bb_path[1:]:
+            path.append(node_id)
+            hops += 1
+            delay_s += self._hop_delay(backbone=True)
+            if hops > self.max_hops:
+                return PacketResult(False, hops, delay_s, tuple(path))
+
+        # final CH -> dst member
+        if dst != dst_ap:
+            if dst not in _alive_neighbors(nodes[dst_ap], nodes):
+                return PacketResult(False, hops, delay_s, tuple(path))
+            path.append(dst)
+            hops += 1
+            delay_s += self._hop_delay(backbone=False)
+
+        if hops > self.max_hops:
+            return PacketResult(False, hops, delay_s, tuple(path))
+
+        return PacketResult(True, hops, delay_s, tuple(path))
