@@ -65,6 +65,30 @@ def reward_transform(r: float) -> float:
     return clamp(r, -1.0, 1.0)
 
 
+def _snap_to_simplex(raw: Tuple[float, float, float, float], step: float = 0.05) -> Action:
+    vals = [max(0.0, x) for x in raw]
+    total = sum(vals)
+    if total <= 0:
+        return (0.25, 0.25, 0.25, 0.25)
+
+    vals = [x / total for x in vals]
+    snapped = [round(x / step) * step for x in vals]
+    total2 = sum(snapped)
+
+    if total2 <= 0:
+        return (0.25, 0.25, 0.25, 0.25)
+
+    snapped = [x / total2 for x in snapped]
+    snapped = [round(x, 10) for x in snapped]
+
+    diff = round(1.0 - sum(snapped), 10)
+    if abs(diff) > 1e-12:
+        idx = max(range(4), key=lambda i: snapped[i])
+        snapped[idx] = round(snapped[idx] + diff, 10)
+
+    return (snapped[0], snapped[1], snapped[2], snapped[3])
+
+
 def smooth_action(
     prev_action: Optional[Action],
     raw_action: Action,
@@ -77,26 +101,7 @@ def smooth_action(
         beta * prev_action[i] + (1.0 - beta) * raw_action[i]
         for i in range(4)
     )
-    total = sum(smoothed)
-    if total <= 0:
-        return (0.25, 0.25, 0.25, 0.25)
-
-    normalized = tuple(x / total for x in smoothed)
-
-    snapped = tuple(round(x / 0.05) * 0.05 for x in normalized)
-    total2 = sum(snapped)
-    if total2 <= 0:
-        return (0.25, 0.25, 0.25, 0.25)
-
-    fixed = [x / total2 for x in snapped]
-    fixed = [round(x, 10) for x in fixed]
-
-    diff = round(1.0 - sum(fixed), 10)
-    if abs(diff) > 1e-12:
-        idx = max(range(4), key=lambda i: fixed[i])
-        fixed[idx] = round(fixed[idx] + diff, 10)
-
-    return (fixed[0], fixed[1], fixed[2], fixed[3])
+    return _snap_to_simplex(smoothed, step=0.05)
 
 
 class QLearningStrategy:
@@ -164,10 +169,19 @@ class QLearningStrategy:
             scored: List[Tuple[float, Action]] = []
             for a in candidates:
                 q = self.get_q(s, a)
+
                 if self.last_action is not None and a == self.last_action:
                     q += self.stickiness_bonus
+
+                # slight prior toward practical paper-like choices
+                w1, w2, w3, w4 = a
+                q += 0.02 * w1
+                q += 0.01 * w4
+                q -= 0.01 * max(0.0, w3 - 0.30)
+
                 if a == self.default_action:
-                    q += 0.01
+                    q += 0.005
+
                 scored.append((q, a))
 
             best_q = max(q for q, _ in scored)

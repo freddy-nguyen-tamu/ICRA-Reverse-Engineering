@@ -13,17 +13,17 @@ class SimConfig:
     sim_time_s: int = 1500
     dt_s: float = 1.0
 
-    # stabilized re-clustering period
-    clustering_interval_s: int = 5
+    # re-clustering
+    clustering_interval_s: int = 8
 
     # area and radio
     area_km: Tuple[float, float] = (10.0, 10.0)
-    comm_radius_km: float = 1.0
+    comm_radius_km: float = 1.2
 
     # mobility
-    gauss_markov_alpha: float = 0.8
-    speed_noise_std: float = 0.80
-    heading_noise_std: float = 0.04
+    gauss_markov_alpha: float = 0.92
+    speed_noise_std: float = 0.45
+    heading_noise_std: float = 0.025
 
     # traffic
     packet_gen_prob_per_s: float = 0.02
@@ -31,64 +31,71 @@ class SimConfig:
     data_rate_kbps: int = 1000
     per_hop_processing_delay_s: float = 0.0008
     mac_contention_delay_s: float = 0.0008
-    queueing_delay_s: float = 0.0012
+    queueing_delay_s: float = 0.0010
     max_hops: int = 30
 
     # energy
-    ehf_j_per_s: float = 2.0
-    en_j_per_s: float = 1.0
+    ehf_j_per_s: float = 1.75
+    en_j_per_s: float = 0.95
     e_tx_j: float = 0.05
     e_rx_j: float = 0.02
-    e_ch_proc_j: float = 0.008
+    e_ch_proc_j: float = 0.007
 
     # control plane
     control_packet_size_bytes: int = 64
-    e_ctrl_tx_j: float = 0.006
-    e_ctrl_rx_j: float = 0.003
+    e_ctrl_tx_j: float = 0.005
+    e_ctrl_rx_j: float = 0.0025
     ctrl_proc_delay_s: float = 0.0002
 
     # clustering / utility
-    lht_threshold_s: float = 0.20
-    lht_cap_s: float = 60.0
+    lht_threshold_s: float = 0.40
+    lht_cap_s: float = 90.0
 
     # retention / hysteresis
-    join_hysteresis_margin: float = 0.08
-    ch_retain_margin: float = 0.10
-    min_ch_tenure_s: float = 12.0
-    max_cluster_members: int = 18
+    join_hysteresis_margin: float = 0.12
+    ch_retain_margin: float = 0.16
+    min_ch_tenure_s: float = 20.0
+    max_cluster_members: int = 20
 
-    # slightly relaxed so the gateway layer can connect more CHs
-    min_gateway_lht_s: float = 0.18
+    # gateway layer
+    min_gateway_lht_s: float = 0.45
 
     # connectivity-aware CH scoring
-    min_ch_neighbor_count: int = 1
-    prefer_connected_ch_bonus: float = 0.10
-    isolated_ch_penalty: float = 0.12
+    min_ch_neighbor_count: int = 2
+    prefer_connected_ch_bonus: float = 0.16
+    isolated_ch_penalty: float = 0.20
 
     # forwarder / gateway selection
-    forwarder_reuse_bonus: float = 0.07
-    gateway_crosslink_weight: float = 0.50
-    gateway_utility_weight: float = 0.18
-    gateway_energy_weight: float = 0.12
-    gateway_stability_weight: float = 0.10
-    gateway_multicluster_bonus: float = 0.10
-    direct_ch_link_bonus: float = 0.08
+    forwarder_reuse_bonus: float = 0.09
+    gateway_crosslink_weight: float = 0.58
+    gateway_utility_weight: float = 0.14
+    gateway_energy_weight: float = 0.14
+    gateway_stability_weight: float = 0.14
+    gateway_multicluster_bonus: float = 0.12
+    direct_ch_link_bonus: float = 0.10
 
     # RL
-    reward_lambda: float = 0.50
+    reward_lambda: float = 0.35
     role_change_threshold: int = 2
-    q_alpha: float = 0.35
-    q_gamma: float = 0.0
-    q_epsilon: float = 0.06
-    q_epsilon_min: float = 0.01
-    q_epsilon_decay: float = 0.997
+    q_alpha: float = 0.22
+    q_gamma: float = 0.35
+    q_epsilon: float = 0.05
+    q_epsilon_min: float = 0.005
+    q_epsilon_decay: float = 0.998
     q_step: float = 0.05
 
     # RL stability controls
-    action_stickiness_bonus: float = 0.08
-    min_action_hold_rounds: int = 6
-    weight_smoothing_beta: float = 0.82
-    allow_action_jump_l1: float = 0.40
+    action_stickiness_bonus: float = 0.12
+    min_action_hold_rounds: int = 8
+    weight_smoothing_beta: float = 0.88
+    allow_action_jump_l1: float = 0.20
+
+    # reward weights for paper-like behavior
+    reward_role_changes_weight: float = 0.26
+    reward_energy_weight: float = 0.24
+    reward_pdr_weight: float = 0.24
+    reward_delay_weight: float = 0.18
+    reward_isolation_weight: float = 0.08
 
     # reproducibility
     seed: int = 7

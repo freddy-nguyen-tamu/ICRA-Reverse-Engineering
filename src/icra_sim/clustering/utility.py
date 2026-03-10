@@ -17,10 +17,15 @@ def velocity_distance(node_i: Node, node_j: Node) -> float:
     """
     Paper Eq. 9:
     d_ij = sqrt((v_i - v_j)^2 + (theta_i - theta_j)^2)
+
+    We keep the same structure, but wrap heading difference to avoid
+    artificial discontinuity near +/-pi.
     """
+    dtheta = abs(node_i.heading_rad - node_j.heading_rad)
+    dtheta = min(dtheta, 2.0 * math.pi - dtheta)
     return math.sqrt(
         (node_i.speed_m_s - node_j.speed_m_s) ** 2
-        + (node_i.heading_rad - node_j.heading_rad) ** 2
+        + dtheta ** 2
     )
 
 
@@ -35,22 +40,39 @@ def velocity_similarity(node_i: Node, node_j: Node) -> float:
 
 def mobility_stability_factor(node: Node, nodes: Dict[int, Node]) -> float:
     """
-    Paper Eq. 11-12 exactly:
-      Vbar = mean(V_ij)
-      s3 = mean((V_ij - Vbar)^2)
+    Use higher-is-better mean velocity similarity for CH election.
 
-    Note:
-    This is intentionally the paper's formula, even though it behaves
-    like a dispersion term rather than a "higher-is-better" similarity term.
+    Why:
+    The paper text describes this factor as velocity similarity and CH election
+    is utility-maximizing. Using variance here makes stable nodes less likely
+    to become CHs, which hurts topology stability and lifetime.
     """
     nbrs = _valid_neighbor_ids(node, nodes)
     if not nbrs:
         return 0.0
 
     sims = [velocity_similarity(node, nodes[j]) for j in nbrs]
-    vbar = mean(sims)
-    s3 = mean((v - vbar) ** 2 for v in sims)
-    return clamp(s3, 0.0, 1.0)
+    return clamp(mean(sims), 0.0, 1.0)
+
+
+def link_stability_factor(
+    node: Node,
+    nodes: Dict[int, Node],
+    comm_radius_m: float,
+    lht_cap_s: float,
+) -> float:
+    nbrs = _valid_neighbor_ids(node, nodes)
+    if not nbrs:
+        return 0.0
+
+    lhts = [link_holding_time_s(node, nodes[j], comm_radius_m) for j in nbrs]
+    stable = [min(x, lht_cap_s) / max(1e-9, lht_cap_s) for x in lhts]
+
+    # Blend mean LET with a mild percentile-like robustness bonus.
+    stable_sorted = sorted(stable)
+    p50 = stable_sorted[len(stable_sorted) // 2]
+    score = 0.75 * mean(stable) + 0.25 * p50
+    return clamp(score, 0.0, 1.0)
 
 
 @dataclass(frozen=True)
@@ -67,7 +89,7 @@ def compute_factors(
     comm_radius_m: float,
     n_total: int,
     lht_cap_s: float,
-    v_max: float,  # kept for API compatibility
+    v_max: float,
 ) -> UtilityFactors:
     # Eq. 7
     s1 = clamp(node.e_j / max(1e-9, node.e0_j), 0.0, 1.0)
@@ -78,15 +100,11 @@ def compute_factors(
     # Eq. 8
     s2 = clamp(deg / max(1, (n_total - 1)), 0.0, 1.0)
 
-    # Eq. 12
+    # Mobility similarity: higher is better
     s3 = mobility_stability_factor(node, nodes)
 
-    # Eq. 14
-    if not nbrs:
-        s4 = 0.0
-    else:
-        lhts = [link_holding_time_s(node, nodes[j], comm_radius_m) for j in nbrs]
-        s4 = clamp(mean(lhts) / max(1e-9, lht_cap_s), 0.0, 1.0)
+    # Link stability
+    s4 = link_stability_factor(node, nodes, comm_radius_m, lht_cap_s)
 
     return UtilityFactors(s1, s2, s3, s4)
 

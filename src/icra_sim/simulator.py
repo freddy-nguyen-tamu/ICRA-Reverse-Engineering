@@ -11,7 +11,13 @@ from .metrics import RunMetrics, avg_role_changes, count_isolation_clusters, fir
 from .mobility.gauss_markov import GaussMarkovMobility
 from .node import Node, Role
 from .radio import build_neighbor_tables
-from .rl.qlearning import QLearningStrategy, generate_action_space, network_state, reward_transform
+from .rl.qlearning import (
+    QLearningStrategy,
+    generate_action_space,
+    network_state,
+    reward_transform,
+    smooth_action,
+)
 from .routing.router import Router
 from .utils import clamp, set_seed
 
@@ -49,10 +55,6 @@ def _apply_control_overhead(
     forwarders: set[int],
     is_icra: bool,
 ) -> float:
-    """
-    Approximate first-clustering control cost.
-    Unlike your old code, this no longer adds a big extra per-node ICRA penalty.
-    """
     alive_nodes = [n for n in nodes.values() if n.e_j > 0]
     n_alive = len(alive_nodes)
     if n_alive == 0:
@@ -60,7 +62,6 @@ def _apply_control_overhead(
 
     time_cost_s = 0.0
 
-    # hello exchange
     for n in alive_nodes:
         n.e_j -= cfg.e_ctrl_tx_j
         time_cost_s += cfg.ctrl_proc_delay_s
@@ -69,7 +70,6 @@ def _apply_control_overhead(
                 nodes[j].e_j -= 0.20 * cfg.e_ctrl_rx_j
                 time_cost_s += 0.20 * cfg.ctrl_proc_delay_s
 
-    # utility / CH declaration / join
     for ch, members in clusters.items():
         if ch not in nodes or nodes[ch].e_j <= 0:
             continue
@@ -80,35 +80,22 @@ def _apply_control_overhead(
         for m in members:
             if m == ch or m not in nodes or nodes[m].e_j <= 0:
                 continue
-            nodes[m].e_j -= 0.50 * cfg.e_ctrl_tx_j
-            nodes[ch].e_j -= 0.50 * cfg.e_ctrl_rx_j
+            nodes[m].e_j -= 0.45 * cfg.e_ctrl_tx_j
+            nodes[ch].e_j -= 0.45 * cfg.e_ctrl_rx_j
             time_cost_s += cfg.ctrl_proc_delay_s
 
-    # forwarder maintenance
     for f in forwarders:
         if f in nodes and nodes[f].e_j > 0:
-            nodes[f].e_j -= 0.40 * (cfg.e_ctrl_tx_j + cfg.e_ctrl_rx_j)
-            time_cost_s += 0.40 * cfg.ctrl_proc_delay_s
+            nodes[f].e_j -= 0.35 * (cfg.e_ctrl_tx_j + cfg.e_ctrl_rx_j)
+            time_cost_s += 0.35 * cfg.ctrl_proc_delay_s
 
-    # GS feedback / strategy update for ICRA
     if is_icra:
-        gs_cost = 0.15 * n_alive * cfg.ctrl_proc_delay_s
-        time_cost_s += gs_cost
+        time_cost_s += 0.10 * n_alive * cfg.ctrl_proc_delay_s
 
     for n in nodes.values():
         n.e_j = max(0.0, n.e_j)
 
     return time_cost_s
-
-
-def _pick_random_pair(alive_ids: List[int]) -> Optional[Tuple[int, int]]:
-    if len(alive_ids) < 2:
-        return None
-    src = random.choice(alive_ids)
-    dst = random.choice(alive_ids)
-    while dst == src:
-        dst = random.choice(alive_ids)
-    return src, dst
 
 
 def _apply_steady_energy(nodes: Dict[int, Node], cfg: SimConfig, dt_s: float) -> None:
@@ -147,11 +134,17 @@ def _interval_reward(
     nodes: Dict[int, Node],
     interval_energy_start: Dict[int, float],
     interval_role_changes: int,
+    interval_packets_generated: int,
+    interval_packets_delivered: int,
+    interval_delay_sum_s: float,
+    interval_isolation_sum: float,
+    interval_isolation_samples: int,
     cfg: SimConfig,
 ) -> float:
-    # Paper-style 2-term reward
+    # Topology stability
     Rc = 1.0 if interval_role_changes < cfg.role_change_threshold else -1.0
 
+    # Energy efficiency
     deltas: List[float] = []
     for i, node in nodes.items():
         if i not in interval_energy_start:
@@ -161,11 +154,42 @@ def _interval_reward(
         delta = (interval_energy_start[i] - node.e_j) / node.e0_j
         deltas.append(delta)
 
-    deltaE = sum(deltas) / len(deltas) if deltas else 0.0
-    Ec = clamp(1.0 - 2.0 * deltaE, -1.0, 1.0)
+    delta_e = sum(deltas) / len(deltas) if deltas else 0.0
+    Ec = clamp(1.0 - 2.0 * delta_e, -1.0, 1.0)
 
-    r = cfg.reward_lambda * Rc + (1.0 - cfg.reward_lambda) * Ec
-    return reward_transform(clamp(r, -1.0, 1.0))
+    # Packet delivery ratio
+    pdr = (
+        interval_packets_delivered / interval_packets_generated
+        if interval_packets_generated > 0
+        else 0.5
+    )
+    Pc = clamp(2.0 * pdr - 1.0, -1.0, 1.0)
+
+    # Delay
+    avg_delay = (
+        interval_delay_sum_s / interval_packets_delivered
+        if interval_packets_delivered > 0
+        else 0.05
+    )
+    delay_ref = 0.020
+    Dc = clamp(1.0 - 2.0 * (avg_delay / max(1e-9, delay_ref)), -1.0, 1.0)
+
+    # Isolation
+    iso_avg = (
+        interval_isolation_sum / interval_isolation_samples
+        if interval_isolation_samples > 0
+        else 0.0
+    )
+    Ic = clamp(1.0 - 0.5 * iso_avg, -1.0, 1.0)
+
+    reward = (
+        cfg.reward_role_changes_weight * Rc
+        + cfg.reward_energy_weight * Ec
+        + cfg.reward_pdr_weight * Pc
+        + cfg.reward_delay_weight * Dc
+        + cfg.reward_isolation_weight * Ic
+    )
+    return reward_transform(clamp(reward, -1.0, 1.0))
 
 
 def run_simulation(
@@ -252,6 +276,9 @@ def run_simulation(
             epsilon=cfg.q_epsilon,
             epsilon_min=cfg.q_epsilon_min,
             epsilon_decay=cfg.q_epsilon_decay,
+            stickiness_bonus=cfg.action_stickiness_bonus,
+            min_action_hold_rounds=cfg.min_action_hold_rounds,
+            allow_action_jump_l1=cfg.allow_action_jump_l1,
         )
 
     weight_history: List[Tuple[float, float, float, float]] = []
@@ -271,6 +298,11 @@ def run_simulation(
 
     interval_energy_start: Dict[int, float] = {}
     interval_role_changes: int = 0
+    interval_packets_generated: int = 0
+    interval_packets_delivered: int = 0
+    interval_delay_sum_s: float = 0.0
+    interval_isolation_sum: float = 0.0
+    interval_isolation_samples: int = 0
 
     for t in range(0, cfg.sim_time_s, int(cfg.dt_s)):
         for node in nodes.values():
@@ -307,16 +339,31 @@ def run_simulation(
                 assert q_strategy is not None
                 s = network_state(nodes)
 
-                # update Q from the previous interval
                 if prev_state is not None and prev_action is not None:
-                    reward = _interval_reward(nodes, interval_energy_start, interval_role_changes, cfg)
+                    reward = _interval_reward(
+                        nodes=nodes,
+                        interval_energy_start=interval_energy_start,
+                        interval_role_changes=interval_role_changes,
+                        interval_packets_generated=interval_packets_generated,
+                        interval_packets_delivered=interval_packets_delivered,
+                        interval_delay_sum_s=interval_delay_sum_s,
+                        interval_isolation_sum=interval_isolation_sum,
+                        interval_isolation_samples=interval_isolation_samples,
+                        cfg=cfg,
+                    )
                     q_strategy.update(prev_state, prev_action, reward, s)
 
-                a = q_strategy.select_action(s)
-                current_weights = a
+                raw_action = q_strategy.select_action(s)
+                current_weights = smooth_action(
+                    prev_action=current_weights,
+                    raw_action=raw_action,
+                    beta=cfg.weight_smoothing_beta,
+                )
+
                 prev_state = s
-                prev_action = a
-                weight_history.append(a)
+                prev_action = raw_action
+                weight_history.append(current_weights)
+
                 result = icra_clusterer.cluster(
                     nodes,
                     current_weights,
@@ -346,8 +393,12 @@ def run_simulation(
             interval_role_changes = sum(
                 nodes[i].role_change_count - role_counts_before.get(i, 0) for i in nodes.keys()
             )
+            interval_packets_generated = 0
+            interval_packets_delivered = 0
+            interval_delay_sum_s = 0.0
+            interval_isolation_sum = 0.0
+            interval_isolation_samples = 0
 
-        # traffic
         alive_ids = [i for i, n in nodes.items() if n.e_j > 0]
         if alive_ids:
             for src in alive_ids:
@@ -359,27 +410,42 @@ def run_simulation(
                     dst = random.choice(alive_ids)
 
                 packets_generated += 1
+                interval_packets_generated += 1
 
                 pkt = router.route_packet(nodes, src, dst)
                 if pkt.delivered:
                     packets_delivered += 1
+                    interval_packets_delivered += 1
                     delay_sum_s += pkt.delay_s
+                    interval_delay_sum_s += pkt.delay_s
                     _apply_path_energy(nodes, pkt.path, cfg)
 
         _apply_steady_energy(nodes, cfg, cfg.dt_s)
 
         if active_clusters:
-            isolation_cluster_sum += count_isolation_clusters(active_clusters, threshold=2)
+            iso_now = count_isolation_clusters(active_clusters, threshold=2)
+            isolation_cluster_sum += iso_now
             isolation_cluster_samples += 1
+            interval_isolation_sum += iso_now
+            interval_isolation_samples += 1
 
         for i, node in nodes.items():
             if node.e_j <= 0 and i not in dead_time:
                 dead_time[i] = float(t)
 
-    # final RL update for the last interval
     if protocol == "icra" and q_strategy is not None and prev_state is not None and prev_action is not None:
         s_next = network_state(nodes)
-        reward = _interval_reward(nodes, interval_energy_start, interval_role_changes, cfg)
+        reward = _interval_reward(
+            nodes=nodes,
+            interval_energy_start=interval_energy_start,
+            interval_role_changes=interval_role_changes,
+            interval_packets_generated=interval_packets_generated,
+            interval_packets_delivered=interval_packets_delivered,
+            interval_delay_sum_s=interval_delay_sum_s,
+            interval_isolation_sum=interval_isolation_sum,
+            interval_isolation_samples=interval_isolation_samples,
+            cfg=cfg,
+        )
         q_strategy.update(prev_state, prev_action, reward, s_next)
 
     metrics = RunMetrics(
