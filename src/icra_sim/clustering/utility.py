@@ -34,8 +34,15 @@ def mobility_stability_factor(node: Node, nodes: Dict[int, Node]) -> float:
 
     sims = [velocity_similarity(node, nodes[j]) for j in nbrs]
     sims_sorted = sorted(sims)
+
     p25 = sims_sorted[max(0, len(sims_sorted) // 4)]
-    return clamp(0.70 * mean(sims) + 0.30 * p25, 0.0, 1.0)
+    p50 = sims_sorted[len(sims_sorted) // 2]
+    worst = sims_sorted[0]
+
+    # Stronger pessimistic shaping than before:
+    # paper favors stable local motion, not average-only motion.
+    score = 0.45 * mean(sims) + 0.30 * p50 + 0.15 * p25 + 0.10 * worst
+    return clamp(score, 0.0, 1.0)
 
 
 def link_stability_factor(
@@ -54,7 +61,10 @@ def link_stability_factor(
 
     p25 = stable_sorted[max(0, len(stable_sorted) // 4)]
     p50 = stable_sorted[len(stable_sorted) // 2]
-    score = 0.55 * mean(stable) + 0.25 * p50 + 0.20 * p25
+    worst = stable_sorted[0]
+
+    # Penalize brittle neighborhoods harder.
+    score = 0.40 * mean(stable) + 0.25 * p50 + 0.20 * p25 + 0.15 * worst
     return clamp(score, 0.0, 1.0)
 
 
@@ -72,7 +82,9 @@ def degree_centrality_factor(node: Node, nodes: Dict[int, Node]) -> float:
     global_deg = deg / max(1, len(alive_nodes) - 1)
     local_deg = deg / max(1, max_deg)
 
-    return clamp(0.35 * global_deg + 0.65 * local_deg, 0.0, 1.0)
+    # Slightly less aggressive than before; degree matters,
+    # but should not dominate energy + stability.
+    return clamp(0.40 * global_deg + 0.60 * local_deg, 0.0, 1.0)
 
 
 @dataclass(frozen=True)
@@ -91,14 +103,25 @@ def compute_factors(
     lht_cap_s: float,
     v_max: float,
 ) -> UtilityFactors:
+    # Eq. (7): residual energy ratio
     s1 = clamp(node.e_j / max(1e-9, node.e0_j), 0.0, 1.0)
+
+    # Eq. (8): degree centrality
     s2 = degree_centrality_factor(node, nodes)
+
+    # Paper text wants velocity similarity to support stability.
     s3 = mobility_stability_factor(node, nodes)
+
+    # Eq. (14): average link holding time (normalized)
     s4 = link_stability_factor(node, nodes, comm_radius_m, lht_cap_s)
+
     return UtilityFactors(s1, s2, s3, s4)
 
 
-def weighted_utility(factors: UtilityFactors, weights: Tuple[float, float, float, float]) -> float:
+def weighted_utility(
+    factors: UtilityFactors,
+    weights: Tuple[float, float, float, float],
+) -> float:
     w1, w2, w3, w4 = weights
     return (
         w1 * factors.s1_energy

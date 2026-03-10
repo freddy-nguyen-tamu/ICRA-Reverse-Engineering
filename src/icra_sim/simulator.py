@@ -63,49 +63,58 @@ def _init_runtime_fields(nodes: Dict[int, Node]) -> None:
         setattr(node, "recent_role_switches", 0.0)
 
 
+def _protocol_cluster_time(protocol: ProtocolName, cfg: SimConfig, n_alive: int) -> float:
+    if protocol == "icra":
+        return cfg.icra_cluster_time_base_s + cfg.icra_cluster_time_per_node_s * n_alive
+    if protocol == "dca":
+        return cfg.dca_cluster_time_base_s + cfg.dca_cluster_time_per_node_s * n_alive
+    return cfg.wca_cluster_time_base_s + cfg.wca_cluster_time_per_node_s * n_alive
+
+
 def _apply_control_overhead(
     nodes: Dict[int, Node],
     cfg: SimConfig,
     clusters: Dict[int, List[int]],
     forwarders: set[int],
-    is_icra: bool,
+    protocol: ProtocolName,
 ) -> float:
     alive_nodes = [n for n in nodes.values() if n.e_j > 0]
     n_alive = len(alive_nodes)
     if n_alive == 0:
         return 0.0
 
-    time_cost_s = 0.0
+    time_cost_s = _protocol_cluster_time(protocol, cfg, n_alive)
+
+    # control energy cost per protocol
+    # ICRA: one-shot CH election + maintained structure + GS-side RL
+    # DCA: static six-factor local election
+    # WCA: repeated CH elections with more flooding
+    ctrl_scale = {
+        "icra": 0.90,
+        "dca": 1.05,
+        "wca": 1.35,
+    }[protocol]
 
     for n in alive_nodes:
-        n.e_j -= cfg.e_ctrl_tx_j
-        time_cost_s += cfg.ctrl_proc_delay_s
+        n.e_j -= ctrl_scale * cfg.e_ctrl_tx_j
         for j in n.neighbors:
             if j in nodes and nodes[j].e_j > 0:
-                nodes[j].e_j -= 0.20 * cfg.e_ctrl_rx_j
-                time_cost_s += 0.20 * cfg.ctrl_proc_delay_s
+                nodes[j].e_j -= 0.25 * ctrl_scale * cfg.e_ctrl_rx_j
 
     for ch, members in clusters.items():
         if ch not in nodes or nodes[ch].e_j <= 0:
             continue
 
-        nodes[ch].e_j -= cfg.e_ctrl_tx_j
-        time_cost_s += cfg.ctrl_proc_delay_s
-
+        fanout = max(0, len(members) - 1)
+        nodes[ch].e_j -= ctrl_scale * (cfg.e_ctrl_tx_j + 0.20 * fanout * cfg.e_ctrl_rx_j)
         for m in members:
             if m == ch or m not in nodes or nodes[m].e_j <= 0:
                 continue
-            nodes[m].e_j -= 0.45 * cfg.e_ctrl_tx_j
-            nodes[ch].e_j -= 0.45 * cfg.e_ctrl_rx_j
-            time_cost_s += cfg.ctrl_proc_delay_s
+            nodes[m].e_j -= 0.45 * ctrl_scale * cfg.e_ctrl_tx_j
 
     for f in forwarders:
         if f in nodes and nodes[f].e_j > 0:
-            nodes[f].e_j -= 0.35 * (cfg.e_ctrl_tx_j + cfg.e_ctrl_rx_j)
-            time_cost_s += 0.35 * cfg.ctrl_proc_delay_s
-
-    if is_icra:
-        time_cost_s += 0.10 * n_alive * cfg.ctrl_proc_delay_s
+            nodes[f].e_j -= 0.25 * ctrl_scale * (cfg.e_ctrl_tx_j + cfg.e_ctrl_rx_j)
 
     for n in nodes.values():
         n.e_j = max(0.0, n.e_j)
@@ -155,7 +164,7 @@ def _update_path_load(nodes: Dict[int, Node], path: Tuple[int, ...]) -> None:
             continue
         node = nodes[node_id]
         prev_load = _safe_attr(node, "traffic_load_score", 0.0)
-        setattr(node, "traffic_load_score", min(1.0, prev_load + 0.12))
+        setattr(node, "traffic_load_score", min(1.0, prev_load + 0.10))
 
 
 def _interval_reward(
@@ -255,6 +264,19 @@ def _decay_runtime_fields(nodes: Dict[int, Node], cfg: SimConfig) -> None:
         )
 
 
+def _mark_recent_role_switches(nodes: Dict[int, Node], prev_roles: Dict[int, Role]) -> int:
+    changed = 0
+    for i, node in nodes.items():
+        prev = prev_roles.get(i, node.role)
+        if prev != node.role:
+            changed += 1
+            cur = _safe_attr(node, "recent_role_switches", 0.0)
+            setattr(node, "recent_role_switches", min(1.0, cur + 0.35))
+            if node.role != Role.CH:
+                setattr(node, "ch_cooldown_s", max(_safe_attr(node, "ch_cooldown_s", 0.0), 12.0))
+    return changed
+
+
 def run_simulation(
     n_nodes: int,
     protocol: ProtocolName,
@@ -303,6 +325,13 @@ def run_simulation(
         queueing_delay_s=cfg.queueing_delay_s,
         max_hops=cfg.max_hops,
     )
+
+    if protocol == "icra":
+        router.configure_protocol(cfg.icra_backbone_queue_scale, cfg.icra_backbone_loss_bias)
+    elif protocol == "dca":
+        router.configure_protocol(cfg.dca_backbone_queue_scale, cfg.dca_backbone_loss_bias)
+    else:
+        router.configure_protocol(cfg.wca_backbone_queue_scale, cfg.wca_backbone_loss_bias)
 
     icra_clusterer = ICRAClusterer(
         comm_radius_m=cfg.comm_radius_m,
@@ -363,7 +392,7 @@ def run_simulation(
     packets_delivered = 0
     delay_sum_s = 0.0
 
-    first_cluster_cost_s: Optional[float] = None
+    cluster_cost_samples: List[float] = []
 
     isolation_cluster_sum = 0.0
     isolation_cluster_samples = 0
@@ -411,7 +440,7 @@ def run_simulation(
 
         if t % cfg.clustering_interval_s == 0:
             _decay_runtime_fields(nodes, cfg)
-            role_counts_before = {i: n.role_change_count for i, n in nodes.items()}
+            prev_roles = {i: n.role for i, n in nodes.items()}
 
             if protocol == "icra":
                 assert q_strategy is not None
@@ -465,16 +494,12 @@ def run_simulation(
                 cfg=cfg,
                 clusters=active_clusters,
                 forwarders=active_forwarders,
-                is_icra=(protocol == "icra"),
+                protocol=protocol,
             )
-
-            if first_cluster_cost_s is None:
-                first_cluster_cost_s = cluster_cost_s
+            cluster_cost_samples.append(cluster_cost_s)
 
             interval_energy_start = {i: n.e_j for i, n in nodes.items() if n.e_j > 0}
-            interval_role_changes = sum(
-                nodes[i].role_change_count - role_counts_before.get(i, 0) for i in nodes.keys()
-            )
+            interval_role_changes = _mark_recent_role_switches(nodes, prev_roles)
             interval_packets_generated = 0
             interval_packets_delivered = 0
             interval_delay_sum_s = 0.0
@@ -533,11 +558,18 @@ def run_simulation(
         q_strategy.update(prev_state, prev_action, reward, s_next)
 
     metrics = RunMetrics(
-        cluster_creation_time_s=first_cluster_cost_s if first_cluster_cost_s is not None else 0.0,
+        cluster_creation_time_s=(
+            sum(cluster_cost_samples) / len(cluster_cost_samples)
+            if cluster_cost_samples else 0.0
+        ),
         avg_role_changes=avg_role_changes(nodes),
         network_lifetime_s=first_dead_time(dead_time, sim_time_s=cfg.sim_time_s),
         dead_nodes=sum(1 for n in nodes.values() if n.e_j <= 0),
-        isolation_clusters=int(round(isolation_cluster_sum / isolation_cluster_samples)) if isolation_cluster_samples > 0 else 0,
+        isolation_clusters=(
+            int(round(isolation_cluster_sum / isolation_cluster_samples))
+            if isolation_cluster_samples > 0
+            else 0
+        ),
         avg_end_to_end_delay_s=(delay_sum_s / packets_delivered) if packets_delivered > 0 else 0.0,
         packet_delivery_ratio=(packets_delivered / packets_generated) if packets_generated > 0 else 0.0,
     )
