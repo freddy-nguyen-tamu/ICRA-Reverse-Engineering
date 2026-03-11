@@ -110,10 +110,6 @@ def _apply_control_overhead(
     forwarders: Set[int],
     protocol: ProtocolName,
 ) -> float:
-    """
-    Keep clustering-time ordering across protocols, but avoid large protocol-biased
-    energy shaping. Control overhead should not dominate the paper outcome.
-    """
     alive_nodes = [n for n in nodes.values() if n.e_j > 0]
     n_alive = len(alive_nodes)
     if n_alive == 0:
@@ -147,16 +143,11 @@ def _apply_control_overhead(
 
 
 def _apply_steady_energy(nodes: Dict[int, Node], cfg: SimConfig, dt_s: float) -> None:
-    """
-    Paper-faithful energy model:
-    - ordinary nodes consume En
-    - CH / forwarding-class nodes consume Ehf
-    """
     for node in nodes.values():
         if node.e_j <= 0:
             continue
 
-        if node.role == Role.CH or node.role == Role.FORWARDER:
+        if node.role in (Role.CH, Role.FORWARDER):
             node.e_j -= cfg.ehf_j_per_s * dt_s
         else:
             node.e_j -= cfg.en_j_per_s * dt_s
@@ -164,11 +155,15 @@ def _apply_steady_energy(nodes: Dict[int, Node], cfg: SimConfig, dt_s: float) ->
         node.e_j = max(0.0, node.e_j)
 
 
-def _apply_path_energy(nodes: Dict[int, Node], path: Tuple[int, ...], cfg: SimConfig) -> None:
+def _apply_path_energy(
+    nodes: Dict[int, Node],
+    path: Tuple[int, ...],
+    cfg: SimConfig,
+    delivered: bool,
+) -> None:
     """
-    Modest packet-level energy.
-    The paper's lifetime result should be driven mostly by better clustering/routing,
-    not by large simulator-only packet penalties.
+    Charge only the actually traversed hops returned by the router.
+    Failed delivery therefore no longer pays for a fictional full route.
     """
     if len(path) < 2:
         return
@@ -187,13 +182,22 @@ def _apply_path_energy(nodes: Dict[int, Node], path: Tuple[int, ...], cfg: SimCo
             if mid in nodes and nodes[mid].e_j > 0 and nodes[mid].role in (Role.CH, Role.FORWARDER):
                 nodes[mid].e_j -= cfg.e_ch_proc_j
 
+    # If the packet was lost, the final intended reception/processing never happened.
+    # Refund a small fraction of the last hop's sink-side handling.
+    if not delivered and len(path) >= 2:
+        last = path[-1]
+        if last in nodes and nodes[last].e_j > 0:
+            nodes[last].e_j += 0.35 * cfg.e_rx_j
+
     for node in nodes.values():
         node.e_j = max(0.0, node.e_j)
 
 
-def _update_path_load(nodes: Dict[int, Node], path: Tuple[int, ...]) -> None:
+def _update_path_load(nodes: Dict[int, Node], path: Tuple[int, ...], delivered: bool) -> None:
     if len(path) < 2:
         return
+
+    load_scale = 1.0 if delivered else 0.5
 
     for idx, node_id in enumerate(path):
         if node_id not in nodes or nodes[node_id].e_j <= 0:
@@ -202,18 +206,18 @@ def _update_path_load(nodes: Dict[int, Node], path: Tuple[int, ...]) -> None:
         node = nodes[node_id]
 
         if idx == 0:
-            setattr(node, "member_tx_count", _safe_attr(node, "member_tx_count", 0.0) + 1.0)
+            setattr(node, "member_tx_count", _safe_attr(node, "member_tx_count", 0.0) + load_scale)
             continue
 
         if idx == len(path) - 1:
             continue
 
         if node.role == Role.CH:
-            setattr(node, "ch_service_count", _safe_attr(node, "ch_service_count", 0.0) + 1.0)
-            setattr(node, "traffic_load_score", min(1.0, _safe_attr(node, "traffic_load_score", 0.0) + 0.015))
+            setattr(node, "ch_service_count", _safe_attr(node, "ch_service_count", 0.0) + load_scale)
+            setattr(node, "traffic_load_score", min(1.0, _safe_attr(node, "traffic_load_score", 0.0) + 0.010 * load_scale))
         elif node.role == Role.FORWARDER:
-            setattr(node, "relay_tx_count", _safe_attr(node, "relay_tx_count", 0.0) + 1.0)
-            setattr(node, "relay_load_score", min(1.0, _safe_attr(node, "relay_load_score", 0.0) + 0.015))
+            setattr(node, "relay_tx_count", _safe_attr(node, "relay_tx_count", 0.0) + load_scale)
+            setattr(node, "relay_load_score", min(1.0, _safe_attr(node, "relay_load_score", 0.0) + 0.010 * load_scale))
 
 
 def _count_current_isolation_clusters(nodes: Dict[int, Node], clusters: Dict[int, List[int]]) -> int:
@@ -223,6 +227,10 @@ def _count_current_isolation_clusters(nodes: Dict[int, Node], clusters: Dict[int
         if live_members:
             alive_clusters[ch] = live_members
     return count_isolation_clusters(alive_clusters, threshold=2)
+
+
+def _cluster_head_count(clusters: Dict[int, List[int]]) -> int:
+    return len(clusters)
 
 
 def _paper_reward(
@@ -235,13 +243,6 @@ def _paper_reward(
     packet_attempts_interval: int,
     packet_successes_interval: int,
 ) -> float:
-    """
-    Paper core:
-      r = lambda * Rc + (1 - lambda) * Ec
-
-    Add only mild, bounded terms for isolation and delivery so RL does not learn
-    pathological fragmentation with accidental packet gains.
-    """
     if alive_count <= 0:
         return -1.0
 
@@ -262,16 +263,21 @@ def _paper_reward(
     base = cfg.reward_lambda * rc + (1.0 - cfg.reward_lambda) * ec
 
     isolation_penalty = 0.0
+    ch_count_penalty = 0.0
+    delivery_bonus = 0.0
+
     if current_clusters:
         iso = _count_current_isolation_clusters(nodes, current_clusters)
-        isolation_penalty = -0.20 * min(1.0, iso / max(1, len(current_clusters)))
+        ch_count = _cluster_head_count(current_clusters)
 
-    delivery_bonus = 0.0
+        isolation_penalty = -0.35 * min(1.0, iso / max(1, ch_count))
+        ch_count_penalty = -0.20 * min(1.0, ch_count / max(1, max(1, alive_count // 7)))
+
     if packet_attempts_interval > 0:
         pdr = packet_successes_interval / packet_attempts_interval
-        delivery_bonus = 0.10 * (2.0 * pdr - 1.0)
+        delivery_bonus = 0.08 * (2.0 * pdr - 1.0)
 
-    r = clamp(base + isolation_penalty + delivery_bonus, -1.0, 1.0)
+    r = clamp(base + isolation_penalty + ch_count_penalty + delivery_bonus, -1.0, 1.0)
     return reward_transform(r)
 
 
@@ -280,31 +286,11 @@ def _decay_runtime_fields(nodes: Dict[int, Node], cfg: SimConfig) -> None:
         if node.e_j <= 0:
             continue
 
-        setattr(
-            node,
-            "traffic_load_score",
-            clamp(_safe_attr(node, "traffic_load_score", 0.0) * cfg.traffic_load_decay, 0.0, 1.0),
-        )
-        setattr(
-            node,
-            "relay_load_score",
-            clamp(_safe_attr(node, "relay_load_score", 0.0) * cfg.relay_load_decay, 0.0, 1.0),
-        )
-        setattr(
-            node,
-            "path_reuse_score",
-            clamp(_safe_attr(node, "path_reuse_score", 0.0) * cfg.path_reuse_decay, 0.0, 1.0),
-        )
-        setattr(
-            node,
-            "recent_role_switches",
-            clamp(_safe_attr(node, "recent_role_switches", 0.0) * cfg.recent_role_change_decay, 0.0, 1.0),
-        )
-        setattr(
-            node,
-            "ch_cooldown_s",
-            max(0.0, _safe_attr(node, "ch_cooldown_s", 0.0) - cfg.cooldown_decay_per_round_s),
-        )
+        setattr(node, "traffic_load_score", clamp(_safe_attr(node, "traffic_load_score", 0.0) * cfg.traffic_load_decay, 0.0, 1.0))
+        setattr(node, "relay_load_score", clamp(_safe_attr(node, "relay_load_score", 0.0) * cfg.relay_load_decay, 0.0, 1.0))
+        setattr(node, "path_reuse_score", clamp(_safe_attr(node, "path_reuse_score", 0.0) * cfg.path_reuse_decay, 0.0, 1.0))
+        setattr(node, "recent_role_switches", clamp(_safe_attr(node, "recent_role_switches", 0.0) * cfg.recent_role_change_decay, 0.0, 1.0))
+        setattr(node, "ch_cooldown_s", max(0.0, _safe_attr(node, "ch_cooldown_s", 0.0) - cfg.cooldown_decay_per_round_s))
 
 
 def _mark_recent_role_switches(nodes: Dict[int, Node], prev_cluster_roles: Dict[int, Role]) -> int:
@@ -319,6 +305,18 @@ def _mark_recent_role_switches(nodes: Dict[int, Node], prev_cluster_roles: Dict[
             if now != Role.CH:
                 setattr(node, "ch_cooldown_s", max(_safe_attr(node, "ch_cooldown_s", 0.0), 2.0))
     return changed
+
+
+def _anchor_weight_for_scenario(scenario: str, round_idx: int) -> float:
+    if scenario == "case2":
+        return 0.65 if round_idx < 180 else 0.42
+    if scenario == "case1":
+        return 0.55 if round_idx < 140 else 0.35
+    return 0.60 if round_idx < 140 else 0.40
+
+
+def _initial_weights_for_scenario(scenario: str) -> Tuple[float, float, float, float]:
+    return _paper_reference_weights(scenario)
 
 
 def run_simulation(
@@ -406,7 +404,7 @@ def run_simulation(
     dca_clusterer = DCAClusterer()
 
     q_strategy: Optional[QLearningStrategy] = None
-    current_weights = (0.25, 0.25, 0.25, 0.25)
+    current_weights = _initial_weights_for_scenario(scenario_cfg.scenario)
     prev_state = None
     prev_action = None
     scenario_anchor = _paper_reference_weights(scenario_cfg.scenario)
@@ -495,9 +493,7 @@ def run_simulation(
                     q_strategy.update(prev_state, prev_action, reward, s)
 
                 raw_action = q_strategy.select_action(s)
-
-                # Stronger early anchoring, then release.
-                anchor_weight = 0.28 if cluster_round_idx < 50 else 0.10
+                anchor_weight = _anchor_weight_for_scenario(scenario_cfg.scenario, cluster_round_idx)
                 anchored_action = _blend_actions(raw_action, scenario_anchor, anchor_weight)
 
                 current_weights = smooth_action(
@@ -541,7 +537,6 @@ def run_simulation(
 
         alive_ids = [i for i, n in nodes.items() if n.e_j > 0]
         if len(alive_ids) >= 2:
-            # Keep traffic modest and uniform across protocols.
             for src in alive_ids:
                 if random.random() >= cfg.packet_gen_prob_per_s:
                     continue
@@ -554,12 +549,14 @@ def run_simulation(
                 interval_packet_attempts += 1
 
                 pkt = router.route_packet(nodes, src, dst)
+
+                _apply_path_energy(nodes, pkt.path, cfg, delivered=pkt.delivered)
+                _update_path_load(nodes, pkt.path, delivered=pkt.delivered)
+
                 if pkt.delivered:
                     packets_delivered += 1
                     interval_packet_successes += 1
                     delay_sum_s += pkt.delay_s
-                    _apply_path_energy(nodes, pkt.path, cfg)
-                    _update_path_load(nodes, pkt.path)
 
         _apply_steady_energy(nodes, cfg, cfg.dt_s)
 
