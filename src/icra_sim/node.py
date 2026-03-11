@@ -39,25 +39,18 @@ class Node:
     s4: float = 0.0
     utility: float = 0.0
 
-    # Paper-facing topology stability metric:
-    # count only meaningful cluster-role changes, not temporary routing-role churn.
     role_change_count: int = 0
 
     avg_speed: RunningMean = field(default_factory=lambda: RunningMean(window=10))
 
-    # Stability / hysteresis state
     ch_tenure_s: float = 0.0
     time_in_cluster_s: float = 0.0
     last_cluster_head: Optional[int] = None
 
-    # Cached neighbor relationship quality for clustering / routing
     neighbor_lht: Dict[int, float] = field(default_factory=dict)
     neighbor_vel_sim: Dict[int, float] = field(default_factory=dict)
 
-    # Role bookkeeping
     last_role: Role = Role.MEMBER
-
-    # Tracks only CH<->non-CH transitions for the paper's role-change metric.
     cluster_role: Role = Role.MEMBER
 
     def pos(self) -> Tuple[float, float]:

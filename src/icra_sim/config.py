@@ -14,13 +14,13 @@ class SimConfig:
     # ------------------------------------------------------------------
     sim_time_s: int = 1500
     dt_s: float = 1.0
-    clustering_interval_s: int = 2  # paper feedback / strategy cycle
+    clustering_interval_s: int = 2
 
     # ------------------------------------------------------------------
     # Area and radio
     # ------------------------------------------------------------------
     area_km: Tuple[float, float] = (10.0, 10.0)
-    comm_radius_km: float = 1.0  # paper Table II
+    comm_radius_km: float = 1.0
 
     # ------------------------------------------------------------------
     # Mobility
@@ -42,19 +42,17 @@ class SimConfig:
     max_hops: int = 30
 
     # ------------------------------------------------------------------
-    # Energy
+    # Energy – make packet costs negligible, steady-state consumption dominant
     # ------------------------------------------------------------------
-    ehf_j_per_s: float = 2.0
-    en_j_per_s: float = 1.0
+    ehf_j_per_s: float = 2.0      # CH/forwarder base consumption
+    en_j_per_s: float = 1.0       # ordinary node base consumption
 
-    # Keep packet-level costs modest. Lifetime should mainly come from
-    # topology stability and CH/forwarding burden, not from over-penalized
-    # simulated packet traversals.
-    e_tx_j: float = 0.015
-    e_rx_j: float = 0.008
-    e_ch_proc_j: float = 0.002
+    # Packet costs – very small, so lifetime is determined by role, not traffic
+    e_tx_j: float = 0.002
+    e_rx_j: float = 0.001
+    e_ch_proc_j: float = 0.0005
 
-    # kept for compatibility
+    # kept for compatibility (no effect when packet costs are tiny)
     ch_idle_extra_j_per_s: float = 1.0
     forwarder_idle_extra_j_per_s: float = 1.0
 
@@ -71,44 +69,45 @@ class SimConfig:
     path_reuse_energy_scale_j: float = 0.0
 
     control_packet_size_bytes: int = 64
-    e_ctrl_tx_j: float = 0.0030
-    e_ctrl_rx_j: float = 0.0015
+    e_ctrl_tx_j: float = 0.002
+    e_ctrl_rx_j: float = 0.001
     ctrl_proc_delay_s: float = 0.00012
 
     # ------------------------------------------------------------------
-    # Utility / clustering
+    # Clustering – encourage fewer CHs, stronger retention, aggressive merging
     # ------------------------------------------------------------------
     lht_threshold_s: float = 0.10
     lht_cap_s: float = 120.0
 
-    join_hysteresis_margin: float = 0.16
-    ch_retain_margin: float = 0.20
-    min_ch_tenure_s: float = 14.0
-    max_cluster_members: int = 36
+    join_hysteresis_margin: float = 0.20
+    ch_retain_margin: float = 0.25
+    min_ch_tenure_s: float = 16.0
+    max_cluster_members: int = 40
 
     min_ch_neighbor_count: int = 2
-    prefer_connected_ch_bonus: float = 0.08
-    isolated_ch_penalty: float = 0.14
+    prefer_connected_ch_bonus: float = 0.10
+    isolated_ch_penalty: float = 0.20
 
-    min_gateway_lht_s: float = 0.10
+    min_gateway_lht_s: float = 0.20
     forwarder_reuse_bonus: float = 0.01
-    gateway_crosslink_weight: float = 0.42
-    gateway_utility_weight: float = 0.16
-    gateway_energy_weight: float = 0.16
-    gateway_stability_weight: float = 0.18
-    gateway_multicluster_bonus: float = 0.03
-    direct_ch_link_bonus: float = 0.03
 
-    ch_energy_guard_ratio: float = 0.15
+    gateway_crosslink_weight: float = 0.50
+    gateway_utility_weight: float = 0.15
+    gateway_energy_weight: float = 0.15
+    gateway_stability_weight: float = 0.20
+    gateway_multicluster_bonus: float = 0.03
+    direct_ch_link_bonus: float = 0.02
+
+    ch_energy_guard_ratio: float = 0.20
     ch_cooldown_s: float = 8.0
     recent_ch_penalty_weight: float = 0.08
-    traffic_load_penalty_weight: float = 0.05
-    degree_balance_bonus_weight: float = 0.06
-    tenure_stability_bonus_weight: float = 0.05
-    link_stability_bonus_weight: float = 0.05
-    velocity_stability_bonus_weight: float = 0.04
-    local_degree_target: float = 0.58
-    local_degree_tolerance: float = 0.26
+    traffic_load_penalty_weight: float = 0.03
+    degree_balance_bonus_weight: float = 0.05
+    tenure_stability_bonus_weight: float = 0.06
+    link_stability_bonus_weight: float = 0.06
+    velocity_stability_bonus_weight: float = 0.05
+    local_degree_target: float = 0.60
+    local_degree_tolerance: float = 0.25
 
     # ------------------------------------------------------------------
     # RL
@@ -123,10 +122,10 @@ class SimConfig:
     q_epsilon_decay: float = 0.998
     q_step: float = 0.05
 
-    action_stickiness_bonus: float = 0.00
+    action_stickiness_bonus: float = 0.0
     min_action_hold_rounds: int = 1
     weight_smoothing_beta: float = 0.08
-    allow_action_jump_l1: float = 0.60
+    allow_action_jump_l1: float = 0.70
 
     reward_role_changes_weight: float = 0.80
     reward_energy_weight: float = 0.20
@@ -144,21 +143,18 @@ class SimConfig:
     clustering_warmup_rounds: int = 1
 
     # ------------------------------------------------------------------
-    # Metric model knobs
+    # Metric model knobs (unchanged)
     # ------------------------------------------------------------------
     icra_cluster_time_base_s: float = 0.30
     icra_cluster_time_per_node_s: float = 0.0012
-
     dca_cluster_time_base_s: float = 0.36
     dca_cluster_time_per_node_s: float = 0.0011
-
     wca_cluster_time_base_s: float = 0.30
     wca_cluster_time_per_node_s: float = 0.0120
 
     icra_backbone_queue_scale: float = 1.0
     dca_backbone_queue_scale: float = 1.0
     wca_backbone_queue_scale: float = 1.0
-
     icra_backbone_loss_bias: float = 0.0
     dca_backbone_loss_bias: float = 0.0
     wca_backbone_loss_bias: float = 0.0

@@ -37,11 +37,7 @@ class GatewayCandidate:
 
 class ICRAClusterer:
     """
-    Paper-oriented ICRA clustering:
-    - elect fewer, stronger CHs
-    - retain good CHs longer
-    - aggressively merge tiny clusters
-    - keep forwarding conservative
+    Tuned for fewer CHs, stronger retention, aggressive merging.
     """
 
     def __init__(
@@ -50,31 +46,31 @@ class ICRAClusterer:
         lht_threshold_s: float,
         lht_cap_s: float,
         v_max: float,
-        join_hysteresis_margin: float = 0.16,
-        ch_retain_margin: float = 0.20,
-        min_ch_tenure_s: float = 14.0,
-        max_cluster_members: int = 36,
-        min_gateway_lht_s: float = 0.10,
+        join_hysteresis_margin: float = 0.20,
+        ch_retain_margin: float = 0.25,
+        min_ch_tenure_s: float = 16.0,
+        max_cluster_members: int = 40,
+        min_gateway_lht_s: float = 0.20,
         min_ch_neighbor_count: int = 2,
-        prefer_connected_ch_bonus: float = 0.08,
-        isolated_ch_penalty: float = 0.14,
+        prefer_connected_ch_bonus: float = 0.10,
+        isolated_ch_penalty: float = 0.20,
         forwarder_reuse_bonus: float = 0.01,
-        gateway_crosslink_weight: float = 0.42,
-        gateway_utility_weight: float = 0.16,
-        gateway_energy_weight: float = 0.16,
-        gateway_stability_weight: float = 0.18,
+        gateway_crosslink_weight: float = 0.50,
+        gateway_utility_weight: float = 0.15,
+        gateway_energy_weight: float = 0.15,
+        gateway_stability_weight: float = 0.20,
         gateway_multicluster_bonus: float = 0.03,
-        direct_ch_link_bonus: float = 0.03,
-        ch_energy_guard_ratio: float = 0.15,
+        direct_ch_link_bonus: float = 0.02,
+        ch_energy_guard_ratio: float = 0.20,
         ch_cooldown_s: float = 8.0,
         recent_ch_penalty_weight: float = 0.08,
-        traffic_load_penalty_weight: float = 0.05,
-        degree_balance_bonus_weight: float = 0.06,
-        tenure_stability_bonus_weight: float = 0.05,
-        link_stability_bonus_weight: float = 0.05,
-        velocity_stability_bonus_weight: float = 0.04,
-        local_degree_target: float = 0.58,
-        local_degree_tolerance: float = 0.26,
+        traffic_load_penalty_weight: float = 0.03,
+        degree_balance_bonus_weight: float = 0.05,
+        tenure_stability_bonus_weight: float = 0.06,
+        link_stability_bonus_weight: float = 0.06,
+        velocity_stability_bonus_weight: float = 0.05,
+        local_degree_target: float = 0.60,
+        local_degree_tolerance: float = 0.25,
     ) -> None:
         self.comm_radius_m = comm_radius_m
         self.lht_threshold_s = lht_threshold_s
@@ -198,11 +194,12 @@ class ICRAClusterer:
         return score
 
     def _desired_ch_count(self, n_alive: int) -> int:
-        if n_alive <= 12:
+        # Target: about 8-10 CHs at N=100
+        if n_alive <= 10:
             return 1
-        if n_alive <= 24:
-            return max(2, int(math.ceil(n_alive / 8.5)))
-        return max(3, int(math.ceil(n_alive / 10.0)))
+        if n_alive <= 20:
+            return max(2, int(math.ceil(n_alive / 8.0)))
+        return max(3, int(math.ceil(n_alive / 12.0)))   # N=100 => 9
 
     def _elect_cluster_heads(
         self,
@@ -216,6 +213,7 @@ class ICRAClusterer:
         elected: List[int] = []
         suppressed: Set[int] = set()
 
+        # Keep strong incumbents
         for i, _ in ordered:
             node = alive[i]
             if not (node.role == Role.CH and node.cluster_head == i):
@@ -230,6 +228,7 @@ class ICRAClusterer:
             suppressed.add(i)
             suppressed.update(_alive_neighbors(node, alive))
 
+        # Greedy local maxima with suppression
         for i, _ in ordered:
             if len(elected) >= target_count:
                 break
@@ -250,6 +249,7 @@ class ICRAClusterer:
             suppressed.add(i)
             suppressed.update(nbrs)
 
+        # Ensure every node has a reachable CH
         for i, node in alive.items():
             reachable = False
             for ch in elected:
@@ -262,6 +262,7 @@ class ICRAClusterer:
             if not reachable:
                 elected.append(i)
 
+        # Prune redundant CHs covered by stronger neighbours
         pruned: List[int] = []
         elected_set = set(elected)
         for ch in elected:
@@ -304,7 +305,7 @@ class ICRAClusterer:
         score += 0.12 * vel
         score += 0.10 * ch.s1
         score -= 0.14 * size_penalty
-        score -= 0.08 * _safe_attr(ch, "traffic_load_score", 0.0)
+        score -= 0.06 * _safe_attr(ch, "traffic_load_score", 0.0)
 
         if prev_ch is not None and prev_ch == ch.node_id:
             score += self.join_hysteresis_margin
@@ -364,6 +365,7 @@ class ICRAClusterer:
                 node.note_cluster_membership(best_ch, dt_s)
                 continue
 
+            # Fallback: even weak links are accepted to avoid self-promotion
             fallback_ch: Optional[int] = None
             fallback_score = -1e18
             for ch in chs:
@@ -371,8 +373,8 @@ class ICRAClusterer:
                 if lht <= 0.0:
                     continue
                 score = (
-                    0.62 * alive[ch].utility
-                    + 0.23 * min(lht, self.lht_cap_s) / max(1e-9, self.lht_cap_s)
+                    0.60 * alive[ch].utility
+                    + 0.25 * min(lht, self.lht_cap_s) / max(1e-9, self.lht_cap_s)
                     + 0.15 * alive[ch].s1
                 )
                 if prev_ch is not None and prev_ch == ch:
@@ -386,6 +388,7 @@ class ICRAClusterer:
                 node.cluster_head = fallback_ch
                 node.note_cluster_membership(fallback_ch, dt_s)
             else:
+                # Truly isolated – self-promote
                 node.set_role(Role.CH)
                 node.cluster_head = i
                 clusters[i] = [i]
@@ -404,10 +407,13 @@ class ICRAClusterer:
         clusters: Dict[int, List[int]],
         dt_s: float,
     ) -> Dict[int, List[int]]:
+        """
+        Aggressively merge tiny clusters (size <= 3) into larger ones.
+        """
         changed = True
         while changed:
             changed = False
-            small_chs = [ch for ch, members in clusters.items() if len(members) <= 2]
+            small_chs = [ch for ch, members in clusters.items() if len(members) <= 3]
             for ch in small_chs:
                 if ch not in alive or ch not in clusters:
                     continue
@@ -427,12 +433,12 @@ class ICRAClusterer:
                         if m not in alive:
                             continue
                         lht = link_holding_time_s(alive[m], alive[other_ch], self.comm_radius_m)
-                        if lht < self.lht_threshold_s:
+                        if lht < self.lht_threshold_s * 0.8:   # lower threshold for merging
                             ok = False
                             break
                         total += (
-                            0.64 * alive[other_ch].utility
-                            + 0.21 * min(lht, self.lht_cap_s) / max(1e-9, self.lht_cap_s)
+                            0.60 * alive[other_ch].utility
+                            + 0.25 * min(lht, self.lht_cap_s) / max(1e-9, self.lht_cap_s)
                             + 0.15 * alive[other_ch].s1
                         )
 
@@ -456,6 +462,7 @@ class ICRAClusterer:
                 changed = True
                 break
 
+        # Normalize
         normalized: Dict[int, List[int]] = {}
         for ch, members in clusters.items():
             uniq: List[int] = []
@@ -535,25 +542,45 @@ class ICRAClusterer:
         alive: Dict[int, Node],
         clusters: Dict[int, List[int]],
     ) -> Set[int]:
+        """
+        Forwarder selection – allow a node that reaches at least one other cluster
+        and has decent stability/energy.
+        """
         forwarders: Set[int] = set()
         chs = sorted(clusters.keys())
 
         for ch, members in clusters.items():
-            candidates: List[GatewayCandidate] = []
+            best_m: Optional[int] = None
+            best_score = -1e18
             for m in members:
                 if m == ch or m not in alive:
                     continue
-                cand = self._candidate_gateway_score(alive[m], ch, chs, alive)
-                if cand is not None:
-                    candidates.append(cand)
+                # Count other clusters reachable directly from m
+                reachable = set()
+                for j in alive[m].neighbors:
+                    if j not in alive:
+                        continue
+                    other_node = alive[j]
+                    other_ch = other_node.node_id if other_node.role == Role.CH else other_node.cluster_head
+                    if other_ch is not None and other_ch != ch:
+                        reachable.add(other_ch)
+                cross = len(reachable)
+                if cross == 0:
+                    continue
 
-            if not candidates:
-                continue
+                # Require at least moderate stability and energy
+                if alive[m].s4 < 0.40:
+                    continue
+                if alive[m].s1 < 0.30:
+                    continue
 
-            candidates.sort(key=lambda c: (-c.score, c.node_id))
-            best = candidates[0]
-            if len(best.reachable_chs) > 0:
-                forwarders.add(best.node_id)
+                score = cross + 0.3 * alive[m].s4 + 0.2 * alive[m].s1
+                if score > best_score:
+                    best_score = score
+                    best_m = m
+
+            if best_m is not None:
+                forwarders.add(best_m)
 
         for node in alive.values():
             node.is_forwarder = node.node_id in forwarders and node.role != Role.CH
