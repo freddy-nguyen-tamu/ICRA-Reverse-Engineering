@@ -116,6 +116,8 @@ class QLearningStrategy:
         self.sample_scale = sample_scale
         self.context_target: Optional[Action] = None
         self.q: Dict[Tuple[State, Action], float] = {}
+        self.state_updates: Dict[State, int] = {}
+        self.action_updates: Dict[Tuple[State, Action], int] = {}
 
         # Algorithm 2 initialization: Q[s, equal-weights] = 1.
         for s1 in [round(i * 0.1, 1) for i in range(11)]:
@@ -133,8 +135,25 @@ class QLearningStrategy:
     def set_q(self, s: State, a: Action, v: float) -> None:
         self.q[(s, a)] = v
 
+    def _has_only_default_prior(self, s: State) -> bool:
+        known_actions = [a for a in self.actions if (s, a) in self.q]
+        return (
+            len(known_actions) <= 1
+            and abs(self.get_q(s, self.default_action) - 1.0) < 1e-12
+            and self.action_updates.get((s, self.default_action), 0) == 0
+        )
+
+    def _effective_q(self, s: State, a: Action) -> float:
+        q = self.get_q(s, a)
+        if a == self.default_action and self.action_updates.get((s, a), 0) == 0:
+            # Preserve the paper-inspired equal-weight initialization as a
+            # prior, but do not let it permanently dominate greedy selection
+            # before the state has received any real feedback.
+            return 0.0
+        return q
+
     def best_action_value(self, s: State) -> float:
-        return max(self.get_q(s, a) for a in self.actions)
+        return max(self._effective_q(s, a) for a in self.actions)
 
     def _state_target_action(self, s: State) -> Action:
         if max(s) <= 0.0 and self.context_target is None:
@@ -183,13 +202,11 @@ class QLearningStrategy:
         if random.random() < self.epsilon:
             return self._sample_guided_action(s)
 
-        known_actions = [a for a in self.actions if (s, a) in self.q]
-        default_q = self.get_q(s, self.default_action)
-        if len(known_actions) <= 1 and abs(default_q - 1.0) < 1e-12:
-            return self._state_target_action(s)
+        if self._has_only_default_prior(s):
+            return self._sample_guided_action(s) if random.random() < 0.35 else self._state_target_action(s)
 
         best_q = self.best_action_value(s)
-        best_actions = [a for a in self.actions if abs(self.get_q(s, a) - best_q) < 1e-12]
+        best_actions = [a for a in self.actions if abs(self._effective_q(s, a) - best_q) < 1e-12]
         if len(best_actions) == 1:
             return best_actions[0]
 
@@ -204,10 +221,14 @@ class QLearningStrategy:
         )
 
     def update(self, s: State, a: Action, reward: float, s_next: State) -> None:
-        old = self.get_q(s, a)
+        old = self._effective_q(s, a)
         target = reward + self.gamma * self.best_action_value(s_next)
         new = self.alpha * target + (1.0 - self.alpha) * old
         self.set_q(s, a, new)
+        self.state_updates[s] = self.state_updates.get(s, 0) + 1
+        self.action_updates[(s, a)] = self.action_updates.get((s, a), 0) + 1
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+
 
 

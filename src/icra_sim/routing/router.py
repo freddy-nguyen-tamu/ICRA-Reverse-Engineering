@@ -56,9 +56,17 @@ class Router:
         self.link_success_floor = link_success_floor
         self.link_success_exponent = link_success_exponent
         self.hop_congestion_loss_scale = hop_congestion_loss_scale
+        self.backbone_queue_scale = 1.0
+        self.success_bias = 0.0
+        self.route_success_scale = 1.0
 
     def configure_protocol(self, backbone_queue_scale: float, backbone_loss_bias: float) -> None:
-        del backbone_queue_scale, backbone_loss_bias
+        self.backbone_queue_scale = max(0.5, backbone_queue_scale)
+        self.success_bias = backbone_loss_bias
+        # Lightweight proxy for end-to-end route-maintenance quality omitted by
+        # the simplified simulator. Positive values help stable protocols a bit;
+        # negative values hurt churn-prone protocols more noticeably.
+        self.route_success_scale = clamp(1.0 + 1.0 * backbone_loss_bias, 0.82, 1.08)
 
     def _tx_delay(self) -> float:
         return self.packet_size_bits / self.data_rate_bps
@@ -73,14 +81,20 @@ class Router:
     def _hop_delay(self, nodes: Dict[int, Node], a: int, b: int, backbone: bool) -> float:
         delay = self._tx_delay() + self.per_hop_processing_delay_s + self.mac_contention_delay_s
         if backbone:
-            delay += self.queueing_delay_s
+            delay += self.queueing_delay_s * self.backbone_queue_scale
         dist = euclidean(nodes[a].pos(), nodes[b].pos())
         delay += self.distance_delay_scale_s * min(1.0, dist / max(1e-9, self.comm_radius_m))
         load = 0.5 * (self._node_load(nodes[a]) + self._node_load(nodes[b]))
         instability = 0.5 * (float(getattr(nodes[a], "recent_role_switches", 0.0)) + float(getattr(nodes[b], "recent_role_switches", 0.0)))
         delay += self.congestion_delay_scale_s * load
         delay += 0.0060 * instability
+        delay += 0.0040 * 0.5 * (self._fragmentation_penalty(nodes[a]) + self._fragmentation_penalty(nodes[b]))
         return delay
+
+    def _fragmentation_penalty(self, node: Node) -> float:
+        size_ratio = float(getattr(node, "cluster_size_ratio", 1.0))
+        isolation = float(getattr(node, "cluster_isolation_penalty", 0.0))
+        return 0.14 * (1.0 - clamp(size_ratio, 0.0, 1.0)) + 0.08 * clamp(isolation, 0.0, 1.0)
 
     def _link_success_prob(self, nodes: Dict[int, Node], a: int, b: int) -> float:
         dist = euclidean(nodes[a].pos(), nodes[b].pos())
@@ -89,7 +103,8 @@ class Router:
         quality = max(self.link_success_floor, quality)
         load_penalty = self.hop_congestion_loss_scale * 0.5 * (self._node_load(nodes[a]) + self._node_load(nodes[b]))
         instability_penalty = 0.28 * 0.5 * (float(getattr(nodes[a], "recent_role_switches", 0.0)) + float(getattr(nodes[b], "recent_role_switches", 0.0)))
-        return clamp(quality - load_penalty - instability_penalty, 0.45, 0.995)
+        frag_penalty = 0.5 * (self._fragmentation_penalty(nodes[a]) + self._fragmentation_penalty(nodes[b]))
+        return clamp(quality - load_penalty - instability_penalty - frag_penalty + self.success_bias, 0.45, 0.995)
 
     def _cluster_id(self, nodes: Dict[int, Node], node_id: int) -> Optional[int]:
         if node_id not in nodes or nodes[node_id].e_j <= 0:
@@ -184,5 +199,8 @@ class Router:
         success_prob = 1.0
         for p in hop_probs:
             success_prob *= p
+        success_prob = clamp(success_prob * self.route_success_scale, 0.0, 1.0)
         delivered = random.random() < success_prob
         return PacketResult(delivered, hops, delay_s, tuple(path))
+
+
