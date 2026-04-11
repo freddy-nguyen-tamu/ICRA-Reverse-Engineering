@@ -28,17 +28,14 @@ class ClusterResult:
     forwarders: Set[int]
 
 
-@dataclass(frozen=True)
-class GatewayCandidate:
-    node_id: int
-    own_ch: int
-    reachable_chs: Tuple[int, ...]
-    score: float
-
-
 class ICRAClusterer:
-    """
-    Tuned for fewer CHs, stronger retention, aggressive merging.
+    """Paper-core ICRA plus lightweight simulator guards.
+
+    The strict local-maximum-only version is closer to the paper text, but in a
+    lightweight Python simulator without the paper's full OPNET stack it causes
+    excessive CH explosion and fragmentation. This class keeps the paper's four
+    utility factors and hierarchical routing assumptions, while restoring only
+    the clustering guards needed to approximate the missing simulator detail.
     """
 
     def __init__(
@@ -47,73 +44,62 @@ class ICRAClusterer:
         lht_threshold_s: float,
         lht_cap_s: float,
         v_max: float,
-        join_hysteresis_margin: float = 0.20,
-        ch_retain_margin: float = 0.25,
-        min_ch_tenure_s: float = 16.0,
+        join_hysteresis_margin: float = 0.16,
+        ch_retain_margin: float = 0.12,
+        min_ch_tenure_s: float = 12.0,
         max_cluster_members: int = 40,
-        min_gateway_lht_s: float = 0.20,
         min_ch_neighbor_count: int = 2,
-        prefer_connected_ch_bonus: float = 0.10,
-        isolated_ch_penalty: float = 0.20,
-        forwarder_reuse_bonus: float = 0.01,
-        gateway_crosslink_weight: float = 0.50,
-        gateway_utility_weight: float = 0.15,
-        gateway_energy_weight: float = 0.15,
-        gateway_stability_weight: float = 0.20,
-        gateway_multicluster_bonus: float = 0.03,
-        direct_ch_link_bonus: float = 0.02,
         ch_energy_guard_ratio: float = 0.20,
-        ch_cooldown_s: float = 8.0,
-        recent_ch_penalty_weight: float = 0.08,
-        traffic_load_penalty_weight: float = 0.03,
         degree_balance_bonus_weight: float = 0.05,
-        tenure_stability_bonus_weight: float = 0.06,
-        link_stability_bonus_weight: float = 0.06,
-        velocity_stability_bonus_weight: float = 0.05,
-        local_degree_target: float = 0.60,
-        local_degree_tolerance: float = 0.25,
+        tenure_stability_bonus_weight: float = 0.05,
+        link_stability_bonus_weight: float = 0.05,
+        velocity_stability_bonus_weight: float = 0.04,
+        recent_ch_penalty_weight: float = 0.06,
+        traffic_load_penalty_weight: float = 0.04,
+        local_degree_target: float = 0.58,
+        local_degree_tolerance: float = 0.28,
+        small_cluster_size: int = 3,
+        **_: float,
     ) -> None:
         self.comm_radius_m = comm_radius_m
         self.lht_threshold_s = lht_threshold_s
         self.lht_cap_s = lht_cap_s
-        self.v_max = max(1e-9, v_max)
+        self.v_max = max(1.0, v_max)
 
         self.join_hysteresis_margin = join_hysteresis_margin
         self.ch_retain_margin = ch_retain_margin
         self.min_ch_tenure_s = min_ch_tenure_s
         self.max_cluster_members = max_cluster_members
-        self.min_gateway_lht_s = min_gateway_lht_s
-
         self.min_ch_neighbor_count = min_ch_neighbor_count
-        self.prefer_connected_ch_bonus = prefer_connected_ch_bonus
-        self.isolated_ch_penalty = isolated_ch_penalty
-
-        self.forwarder_reuse_bonus = forwarder_reuse_bonus
-        self.gateway_crosslink_weight = gateway_crosslink_weight
-        self.gateway_utility_weight = gateway_utility_weight
-        self.gateway_energy_weight = gateway_energy_weight
-        self.gateway_stability_weight = gateway_stability_weight
-        self.gateway_multicluster_bonus = gateway_multicluster_bonus
-        self.direct_ch_link_bonus = direct_ch_link_bonus
-
         self.ch_energy_guard_ratio = ch_energy_guard_ratio
-        self.ch_cooldown_s = max(1e-9, ch_cooldown_s)
-        self.recent_ch_penalty_weight = recent_ch_penalty_weight
-        self.traffic_load_penalty_weight = traffic_load_penalty_weight
         self.degree_balance_bonus_weight = degree_balance_bonus_weight
         self.tenure_stability_bonus_weight = tenure_stability_bonus_weight
         self.link_stability_bonus_weight = link_stability_bonus_weight
         self.velocity_stability_bonus_weight = velocity_stability_bonus_weight
+        self.recent_ch_penalty_weight = recent_ch_penalty_weight
+        self.traffic_load_penalty_weight = traffic_load_penalty_weight
         self.local_degree_target = local_degree_target
         self.local_degree_tolerance = max(1e-6, local_degree_tolerance)
+        self.small_cluster_size = small_cluster_size
 
-    def _ensure_factors(self, alive: Dict[int, Node]) -> None:
+    def _ensure_factors(
+        self,
+        alive: Dict[int, Node],
+        weights: Tuple[float, float, float, float],
+    ) -> None:
+        n_total = max(1, len(alive))
         for node in alive.values():
+            node.neighbor_lht = {}
+            node.neighbor_vel_sim = {}
+            for j in _alive_neighbors(node, alive):
+                node.neighbor_lht[j] = link_holding_time_s(node, alive[j], self.comm_radius_m)
+                node.neighbor_vel_sim[j] = velocity_similarity(node, alive[j])
+
             factors = compute_factors(
                 node=node,
                 nodes=alive,
                 comm_radius_m=self.comm_radius_m,
-                n_total=max(1, len(alive)),
+                n_total=n_total,
                 lht_cap_s=self.lht_cap_s,
                 v_max=self.v_max,
             )
@@ -121,100 +107,49 @@ class ICRAClusterer:
             node.s2 = factors.s2_degree
             node.s3 = factors.s3_vel_sim
             node.s4 = factors.s4_lht
-
-            node.neighbor_lht = {}
-            node.neighbor_vel_sim = {}
-            for j in _alive_neighbors(node, alive):
-                node.neighbor_lht[j] = link_holding_time_s(node, alive[j], self.comm_radius_m)
-                node.neighbor_vel_sim[j] = velocity_similarity(node, alive[j])
-
-    def _degree_balance_score(self, node: Node, alive: Dict[int, Node]) -> float:
-        deg = len(_alive_neighbors(node, alive))
-        if deg <= 0:
-            return 0.0
-        max_deg = max(1, max(len(_alive_neighbors(n, alive)) for n in alive.values()))
-        local_deg = deg / max_deg
-        z = (local_deg - self.local_degree_target) / self.local_degree_tolerance
-        return max(0.0, math.exp(-(z * z)))
-
-    def _candidate_utility(
-        self,
-        node: Node,
-        weights: Tuple[float, float, float, float],
-        alive: Dict[int, Node],
-    ) -> float:
-        base = weighted_utility(
-            compute_factors(
-                node=node,
-                nodes=alive,
-                comm_radius_m=self.comm_radius_m,
-                n_total=max(1, len(alive)),
-                lht_cap_s=self.lht_cap_s,
-                v_max=self.v_max,
-            ),
-            weights,
-        )
-
-        nbrs = _alive_neighbors(node, alive)
-        deg = len(nbrs)
-
-        avg_lht = 0.0
-        avg_vel = 0.0
-        if deg > 0:
-            avg_lht = sum(min(node.neighbor_lht.get(j, 0.0), self.lht_cap_s) for j in nbrs) / (
-                deg * max(1e-9, self.lht_cap_s)
-            )
-            avg_vel = sum(node.neighbor_vel_sim.get(j, 0.0) for j in nbrs) / deg
-
-        retention_bonus = 0.0
-        if node.role == Role.CH and node.cluster_head == node.node_id:
-            retention_bonus += self.ch_retain_margin
-            retention_bonus += self.tenure_stability_bonus_weight * min(
-                1.0, node.ch_tenure_s / max(1e-9, self.min_ch_tenure_s)
-            )
-
-        score = base
-        score += self.degree_balance_bonus_weight * self._degree_balance_score(node, alive)
-        score += self.link_stability_bonus_weight * avg_lht
-        score += self.velocity_stability_bonus_weight * avg_vel
-        score += retention_bonus
-
-        if deg >= self.min_ch_neighbor_count:
-            score += self.prefer_connected_ch_bonus * min(1.0, deg / 5.0)
-        else:
-            score -= self.isolated_ch_penalty
-
-        if node.s1 < self.ch_energy_guard_ratio:
-            score -= 0.18
-
-        score -= self.recent_ch_penalty_weight * _safe_attr(node, "recent_role_switches", 0.0)
-        score -= self.traffic_load_penalty_weight * _safe_attr(node, "traffic_load_score", 0.0)
-        score -= 0.05 * min(1.0, _safe_attr(node, "ch_cooldown_s", 0.0) / self.ch_cooldown_s)
-
-        node.utility = score
-        return score
+            node.utility = weighted_utility(factors, weights)
 
     def _desired_ch_count(self, n_alive: int) -> int:
-        # Slightly fewer CHs than before: spreads backbone load, improves first-dead time vs dense CH sets
         if n_alive <= 10:
-            return 1
+            return max(2, int(round(n_alive / 4.0)))
         if n_alive <= 20:
-            return max(2, int(math.ceil(n_alive / 9.0)))
-        return max(3, int(math.ceil(n_alive / 14.0)))  # N=100 => ~8
+            return max(3, int(round(n_alive / 5.0)))
+        if n_alive <= 50:
+            return max(5, int(round(n_alive / 7.0)))
+        return max(8, min(14, int(round(n_alive / 9.0))))
 
-    def _elect_cluster_heads(
-        self,
-        alive: Dict[int, Node],
-        weights: Tuple[float, float, float, float],
-    ) -> List[int]:
-        scores = {i: self._candidate_utility(node, weights, alive) for i, node in alive.items()}
+    def _degree_balance_score(self, node: Node, alive: Dict[int, Node]) -> float:
+        deg = len(_alive_neighbors(node, alive)) / max(1, len(alive) - 1)
+        gap = abs(deg - self.local_degree_target)
+        return max(0.0, 1.0 - gap / self.local_degree_tolerance)
+
+    def _ch_score(self, node: Node, alive: Dict[int, Node]) -> float:
+        score = node.utility
+        score += self.degree_balance_bonus_weight * self._degree_balance_score(node, alive)
+        score += self.link_stability_bonus_weight * node.s4
+        score += self.velocity_stability_bonus_weight * node.s3
+        if node.role == Role.CH and node.cluster_head == node.node_id:
+            score += self.tenure_stability_bonus_weight * min(1.0, node.ch_tenure_s / max(1e-9, self.min_ch_tenure_s))
+        score -= self.recent_ch_penalty_weight * min(1.0, _safe_attr(node, "recent_role_switches", 0.0))
+        score -= self.traffic_load_penalty_weight * min(1.0, _safe_attr(node, "traffic_load_score", 0.0))
+        if len(_alive_neighbors(node, alive)) < self.min_ch_neighbor_count:
+            score -= 0.10
+        if node.s1 < self.ch_energy_guard_ratio:
+            score -= 0.15
+        return score
+
+    def _elect_cluster_heads(self, alive: Dict[int, Node]) -> List[int]:
+        if not alive:
+            return []
+
+        scores = {i: self._ch_score(node, alive) for i, node in alive.items()}
         ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
         target_count = self._desired_ch_count(len(alive))
 
         elected: List[int] = []
         suppressed: Set[int] = set()
 
-        # Keep strong incumbents
+        # Keep strong incumbents first.
         for i, _ in ordered:
             node = alive[i]
             if not (node.role == Role.CH and node.cluster_head == i):
@@ -229,13 +164,12 @@ class ICRAClusterer:
             suppressed.add(i)
             suppressed.update(_alive_neighbors(node, alive))
 
-        # Greedy local maxima with suppression
+        # Greedy local maxima with one-hop suppression.
         for i, _ in ordered:
             if len(elected) >= target_count:
                 break
             if i in elected:
                 continue
-
             node = alive[i]
             nbrs = _alive_neighbors(node, alive)
             dominated = False
@@ -250,7 +184,7 @@ class ICRAClusterer:
             suppressed.add(i)
             suppressed.update(nbrs)
 
-        # Ensure every node has a reachable CH
+        # Ensure every node can reach at least one CH through a stable direct link.
         for i, node in alive.items():
             reachable = False
             for ch in elected:
@@ -263,7 +197,7 @@ class ICRAClusterer:
             if not reachable:
                 elected.append(i)
 
-        # Prune redundant CHs covered by stronger neighbours
+        # Prune redundant CHs that are stably covered by stronger CHs.
         pruned: List[int] = []
         elected_set = set(elected)
         for ch in elected:
@@ -282,7 +216,6 @@ class ICRAClusterer:
 
         if not pruned:
             pruned = [ordered[0][0]]
-
         return sorted(set(pruned))
 
     def _member_assignment_score(
@@ -307,17 +240,14 @@ class ICRAClusterer:
         score += 0.10 * ch.s1
         score -= 0.14 * size_penalty
         score -= 0.06 * _safe_attr(ch, "traffic_load_score", 0.0)
-
         if prev_ch is not None and prev_ch == ch.node_id:
             score += self.join_hysteresis_margin
-
         return score
 
     def _assign_members(
         self,
         alive: Dict[int, Node],
         chs: List[int],
-        dt_s: float,
     ) -> Dict[int, List[int]]:
         clusters: Dict[int, List[int]] = {ch: [ch] for ch in chs}
         ch_set = set(chs)
@@ -363,10 +293,9 @@ class ICRAClusterer:
             if best_ch is not None:
                 clusters[best_ch].append(i)
                 node.cluster_head = best_ch
-                node.note_cluster_membership(best_ch, dt_s)
                 continue
 
-            # Fallback: even weak links are accepted to avoid self-promotion
+            # Fallback: accept even weak links rather than immediate self-promotion.
             fallback_ch: Optional[int] = None
             fallback_score = -1e18
             for ch in chs:
@@ -387,18 +316,12 @@ class ICRAClusterer:
             if fallback_ch is not None:
                 clusters[fallback_ch].append(i)
                 node.cluster_head = fallback_ch
-                node.note_cluster_membership(fallback_ch, dt_s)
             else:
-                # Truly isolated – self-promote
                 node.set_role(Role.CH)
                 node.cluster_head = i
                 clusters[i] = [i]
                 ch_set.add(i)
                 chs.append(i)
-
-        for ch in clusters:
-            if ch in alive and alive[ch].role == Role.CH:
-                alive[ch].note_role_tenure(dt_s)
 
         return clusters
 
@@ -406,15 +329,11 @@ class ICRAClusterer:
         self,
         alive: Dict[int, Node],
         clusters: Dict[int, List[int]],
-        dt_s: float,
     ) -> Dict[int, List[int]]:
-        """
-        Aggressively merge tiny clusters (size <= 3) into larger ones.
-        """
         changed = True
         while changed:
             changed = False
-            small_chs = [ch for ch, members in clusters.items() if len(members) <= 3]
+            small_chs = [ch for ch, members in clusters.items() if len(members) <= self.small_cluster_size]
             for ch in small_chs:
                 if ch not in alive or ch not in clusters:
                     continue
@@ -434,7 +353,7 @@ class ICRAClusterer:
                         if m not in alive:
                             continue
                         lht = link_holding_time_s(alive[m], alive[other_ch], self.comm_radius_m)
-                        if lht < self.lht_threshold_s * 0.8:   # lower threshold for merging
+                        if lht < self.lht_threshold_s * 0.8:
                             ok = False
                             break
                         total += (
@@ -454,16 +373,14 @@ class ICRAClusterer:
                     if m not in alive:
                         continue
                     if m == ch:
-                        alive[m].set_role(Role.MEMBER)
+                        alive[m].set_role(Role.MEMBER, count_change=False)
                     alive[m].cluster_head = best_target
-                    alive[m].note_cluster_membership(best_target, dt_s)
                     clusters[best_target].append(m)
 
                 del clusters[ch]
                 changed = True
                 break
 
-        # Normalize
         normalized: Dict[int, List[int]] = {}
         for ch, members in clusters.items():
             uniq: List[int] = []
@@ -487,66 +404,12 @@ class ICRAClusterer:
 
         return normalized
 
-    def _candidate_gateway_score(
-        self,
-        node: Node,
-        own_ch: int,
-        target_chs: List[int],
-        alive: Dict[int, Node],
-    ) -> Optional[GatewayCandidate]:
-        if node.e_j <= 0 or node.role == Role.CH:
-            return None
-        if own_ch not in alive:
-            return None
-
-        own_lht = link_holding_time_s(node, alive[own_ch], self.comm_radius_m)
-        if own_lht < self.lht_threshold_s:
-            return None
-
-        reachable: List[int] = []
-        mean_cross_lht = 0.0
-        for ch in target_chs:
-            if ch == own_ch or ch not in alive:
-                continue
-            lht = link_holding_time_s(node, alive[ch], self.comm_radius_m)
-            if lht >= self.min_gateway_lht_s:
-                reachable.append(ch)
-                mean_cross_lht += min(lht, self.lht_cap_s) / max(1e-9, self.lht_cap_s)
-
-        if not reachable:
-            return None
-
-        mean_cross_lht /= max(1, len(reachable))
-
-        score = 0.0
-        score += self.gateway_crosslink_weight * min(1.0, len(reachable) / 3.0)
-        score += self.gateway_utility_weight * max(0.0, min(1.0, node.utility))
-        score += self.gateway_energy_weight * node.s1
-        score += self.gateway_stability_weight * (0.5 * node.s3 + 0.5 * node.s4)
-        score += 0.08 * mean_cross_lht
-
-        if node.is_forwarder:
-            score += self.forwarder_reuse_bonus
-
-        score -= 0.05 * _safe_attr(node, "traffic_load_score", 0.0)
-        score -= 0.05 * _safe_attr(node, "relay_load_score", 0.0)
-
-        return GatewayCandidate(
-            node_id=node.node_id,
-            own_ch=own_ch,
-            reachable_chs=tuple(sorted(set(reachable))),
-            score=score,
-        )
-
     def _select_forwarders(
         self,
         alive: Dict[int, Node],
         clusters: Dict[int, List[int]],
     ) -> Set[int]:
-        """
-        Forwarder selection – strong cross-cluster links only; cap count so lifetime
-        is not dominated by many simultaneous relay-hot nodes (paper: a limited set of gateways).
-        """
+        """Choose a small number of stable cross-cluster forwarders."""
         forwarders: Set[int] = set()
         n_alive = len(alive)
         best_by_member: Dict[int, float] = {}
@@ -558,23 +421,21 @@ class ICRAClusterer:
                 if m == ch or m not in alive:
                     continue
                 reachable = set()
-                for j in alive[m].neighbors:
-                    if j not in alive:
-                        continue
-                    other_node = alive[j]
-                    other_ch = other_node.node_id if other_node.role == Role.CH else other_node.cluster_head
+                for j in _alive_neighbors(alive[m], alive):
+                    other = alive[j]
+                    other_ch = other.node_id if other.role == Role.CH else other.cluster_head
                     if other_ch is not None and other_ch != ch:
                         reachable.add(other_ch)
                 cross = len(reachable)
                 if cross < 2:
                     continue
-
-                if alive[m].s4 < 0.48:
+                if alive[m].s4 < 0.40:
                     continue
-                if alive[m].s1 < 0.38:
+                if alive[m].s1 < 0.30:
                     continue
 
                 score = cross + 0.35 * alive[m].s4 + 0.25 * alive[m].s1
+                score -= 0.10 * _safe_attr(alive[m], "relay_load_score", 0.0)
                 if score > best_score:
                     best_score = score
                     best_m = m
@@ -585,14 +446,14 @@ class ICRAClusterer:
                     best_by_member[best_m] = best_score
 
         ranked = sorted(best_by_member.items(), key=lambda kv: -kv[1])
-        cap = max(2, min(len(clusters), n_alive // 16))
+        cap = max(2, min(len(clusters), n_alive // 16 + 1))
         for m, _ in ranked[:cap]:
             forwarders.add(m)
 
         for node in alive.values():
             node.is_forwarder = node.node_id in forwarders and node.role != Role.CH
             if node.is_forwarder:
-                node.set_role(Role.FORWARDER)
+                node.set_role(Role.FORWARDER, count_change=False)
 
         return forwarders
 
@@ -600,15 +461,18 @@ class ICRAClusterer:
         self,
         nodes: Dict[int, Node],
         weights: Tuple[float, float, float, float],
-        dt_s: float = 8.0,
+        dt_s: float = 2.0,
         factors_already_set: bool = False,
     ) -> ClusterResult:
         alive = {i: n for i, n in nodes.items() if n.e_j > 0}
         if not alive:
             return ClusterResult(clusters={}, forwarders=set())
 
+        for node in alive.values():
+            node.reset_clustering_flags()
+
         if not factors_already_set:
-            self._ensure_factors(alive)
+            self._ensure_factors(alive, weights)
         else:
             for node in alive.values():
                 node.neighbor_lht = {}
@@ -616,11 +480,21 @@ class ICRAClusterer:
                 for j in _alive_neighbors(node, alive):
                     node.neighbor_lht[j] = link_holding_time_s(node, alive[j], self.comm_radius_m)
                     node.neighbor_vel_sim[j] = velocity_similarity(node, alive[j])
+                node.utility = (
+                    weights[0] * node.s1
+                    + weights[1] * node.s2
+                    + weights[2] * node.s3
+                    + weights[3] * node.s4
+                )
 
-        chs = self._elect_cluster_heads(alive, weights)
-        clusters = self._assign_members(alive, chs, dt_s)
-        clusters = self._repair_small_clusters(alive, clusters, dt_s)
+        chs = self._elect_cluster_heads(alive)
+        clusters = self._assign_members(alive, chs)
+        clusters = self._repair_small_clusters(alive, clusters)
         forwarders = self._select_forwarders(alive, clusters)
+
+        for node in alive.values():
+            node.note_cluster_membership(node.cluster_head, dt_s)
+            node.note_role_tenure(dt_s)
 
         return ClusterResult(clusters=clusters, forwarders=forwarders)
 
@@ -636,17 +510,13 @@ class WCAClusterer:
 
         for node in alive.values():
             deg = len(_alive_neighbors(node, alive))
-            degree_diff = 0.0
-            if alive:
-                avg_deg = sum(len(_alive_neighbors(n, alive)) for n in alive.values()) / len(alive)
-                degree_diff = abs(deg - avg_deg) / max(1.0, avg_deg)
-
+            avg_deg = sum(len(_alive_neighbors(n, alive)) for n in alive.values()) / max(1, len(alive))
+            degree_diff = abs(deg - avg_deg) / max(1.0, avg_deg)
             sum_dist = 0.0
             for j in _alive_neighbors(node, alive):
                 dx = node.x_m - alive[j].x_m
                 dy = node.y_m - alive[j].y_m
                 sum_dist += math.sqrt(dx * dx + dy * dy)
-
             speed_term = min(1.0, node.speed_m_s / 50.0)
             node.utility = (
                 0.40 * (1.0 - min(1.0, deg / max(1, len(alive) - 1)))
@@ -654,19 +524,17 @@ class WCAClusterer:
                 + 0.20 * min(1.0, sum_dist / max(1.0, self.comm_radius_m * 6.0))
                 + 0.15 * speed_term
             )
-            # Mobility + tie jitter: WCA in the paper shows very high CH turnover vs ICRA/DCA
             node.utility += random.uniform(-0.28, 0.28)
+            node.reset_clustering_flags()
 
         unassigned = set(alive.keys())
         clusters: Dict[int, List[int]] = {}
-
         while unassigned:
             ch = min(unassigned, key=lambda i: (alive[i].utility, i))
             clusters[ch] = [ch]
             alive[ch].set_role(Role.CH)
             alive[ch].cluster_head = ch
-
-            members_to_remove = {ch}
+            to_remove = {ch}
             for i in list(unassigned):
                 if i == ch:
                     continue
@@ -674,14 +542,11 @@ class WCAClusterer:
                     alive[i].set_role(Role.MEMBER)
                     alive[i].cluster_head = ch
                     clusters[ch].append(i)
-                    members_to_remove.add(i)
-
-            unassigned -= members_to_remove
+                    to_remove.add(i)
+            unassigned -= to_remove
 
         forwarders: Set[int] = set()
         for ch, members in clusters.items():
-            best_m = None
-            best_score = -1.0
             for m in members:
                 if m == ch:
                     continue
@@ -691,17 +556,16 @@ class WCAClusterer:
                         other_ch = alive[j].cluster_head if alive[j].role != Role.CH else j
                         if other_ch is not None and other_ch != ch:
                             cross += 1
-                score = cross + 0.2 * alive[m].s1
-                if score > best_score:
-                    best_score = score
-                    best_m = m
-            if best_m is not None and best_score > 0:
-                forwarders.add(best_m)
+                if cross > 0:
+                    forwarders.add(m)
+                    break
 
         for node in alive.values():
-            node.is_forwarder = node.node_id in forwarders
+            node.is_forwarder = node.node_id in forwarders and node.role != Role.CH
             if node.is_forwarder:
                 node.set_role(Role.FORWARDER)
+            node.note_cluster_membership(node.cluster_head, 2.0)
+            node.note_role_tenure(2.0)
 
         return ClusterResult(clusters=clusters, forwarders=forwarders)
 
@@ -713,28 +577,20 @@ class DCAClusterer:
             return ClusterResult({}, set())
 
         for node in alive.values():
+            node.reset_clustering_flags()
             deg = len(_alive_neighbors(node, alive))
             deg_norm = min(1.0, deg / max(1, len(alive) - 1))
             energy = node.s1
             lht = node.s4
             vel = node.s3
-            recent = 1.0 - min(1.0, _safe_attr(node, "recent_role_switches", 0.0))
-            load = 1.0 - min(1.0, _safe_attr(node, "traffic_load_score", 0.0))
-            node.utility = 0.22 * energy + 0.18 * deg_norm + 0.18 * lht + 0.14 * vel + 0.14 * recent + 0.14 * load
-            # Small perturbation: link-quality–driven local maxima shift as topology moves (paper: more restructuring than ICRA)
-            node.utility += random.uniform(-0.035, 0.035)
+            node.utility = 0.30 * energy + 0.25 * deg_norm + 0.25 * lht + 0.20 * vel
+            node.utility += random.uniform(-0.03, 0.03)
 
         chs: List[int] = []
         for i, node in alive.items():
             nbrs = _alive_neighbors(node, alive)
-            local_best = True
-            for j in nbrs:
-                if alive[j].utility > node.utility + 1e-12:
-                    local_best = False
-                    break
-            if local_best:
+            if all(alive[j].utility <= node.utility + 1e-12 for j in nbrs):
                 chs.append(i)
-
         if not chs:
             chs = [max(alive.keys(), key=lambda i: alive[i].utility)]
 
@@ -746,17 +602,15 @@ class DCAClusterer:
         for i, node in alive.items():
             if i in clusters:
                 continue
-
             best = None
             best_score = -1e18
             for ch in chs:
                 if ch not in node.neighbors:
                     continue
-                score = 0.65 * alive[ch].utility + 0.20 * alive[ch].s4 + 0.15 * alive[ch].s1
+                score = 0.60 * alive[ch].utility + 0.25 * alive[ch].s4 + 0.15 * alive[ch].s1
                 if score > best_score:
                     best_score = score
                     best = ch
-
             if best is None:
                 node.set_role(Role.CH)
                 node.cluster_head = i
@@ -777,7 +631,7 @@ class DCAClusterer:
                         other_ch = alive[j].cluster_head if alive[j].role != Role.CH else j
                         if other_ch is not None and other_ch != ch:
                             cross += 1
-                if cross >= 2 and alive[m].s4 >= 0.35:
+                if cross >= 1 and alive[m].s4 >= 0.30:
                     forwarders.add(m)
                     break
 
@@ -785,5 +639,7 @@ class DCAClusterer:
             node.is_forwarder = node.node_id in forwarders and node.role != Role.CH
             if node.is_forwarder:
                 node.set_role(Role.FORWARDER)
+            node.note_cluster_membership(node.cluster_head, 2.0)
+            node.note_role_tenure(2.0)
 
         return ClusterResult(clusters=clusters, forwarders=forwarders)

@@ -9,108 +9,75 @@ from ..node import Node
 from ..utils import clamp, mean
 
 
-def _valid_neighbor_ids(node: Node, nodes: Dict[int, Node]) -> List[int]:
+def _alive_neighbors(node: Node, nodes: Dict[int, Node]) -> List[int]:
     return [j for j in node.neighbors if j in nodes and nodes[j].e_j > 0]
 
 
 def velocity_distance(node_i: Node, node_j: Node) -> float:
+    """
+    Paper Eq. (9) uses the Euclidean distance between the two velocity states.
+    In this lightweight implementation, the velocity state is represented by
+    (speed, heading).
+    """
     dtheta = abs(node_i.heading_rad - node_j.heading_rad)
     dtheta = min(dtheta, 2.0 * math.pi - dtheta)
-    return math.sqrt(
-        (node_i.speed_m_s - node_j.speed_m_s) ** 2
-        + dtheta ** 2
-    )
+    return math.sqrt((node_i.speed_m_s - node_j.speed_m_s) ** 2 + dtheta ** 2)
 
 
 def velocity_similarity(node_i: Node, node_j: Node) -> float:
-    d_ij = velocity_distance(node_i, node_j)
-    return 1.0 / (1.0 + d_ij)
+    # Eq. (10)
+    return 1.0 / (1.0 + velocity_distance(node_i, node_j))
 
 
-def mobility_stability_factor(node: Node, nodes: Dict[int, Node]) -> float:
-    nbrs = _valid_neighbor_ids(node, nodes)
+def residual_energy_factor(node: Node) -> float:
+    # Eq. (7)
+    return clamp(node.e_j / max(1e-9, node.e0_j), 0.0, 1.0)
+
+
+def degree_centrality_factor(node: Node, nodes: Dict[int, Node], n_total: int) -> float:
+    # Eq. (8)
+    deg = len(_alive_neighbors(node, nodes))
+    return clamp(deg / max(1, n_total - 1), 0.0, 1.0)
+
+
+def velocity_similarity_factor(node: Node, nodes: Dict[int, Node]) -> float:
+    """
+    The paper text calls s3 a velocity-similarity factor, but the printed Eq. (12)
+    is a variance-like dispersion term. To preserve the paper's stated intent
+    (higher utility for more similar motion), we compute the Eq. (10)/(11)
+    similarities and convert the Eq. (12) dispersion into a monotone stability
+    score in [0, 1].
+    """
+    nbrs = _alive_neighbors(node, nodes)
     if not nbrs:
         return 0.0
 
     sims = [velocity_similarity(node, nodes[j]) for j in nbrs]
-    sims_sorted = sorted(sims)
-
-    p25 = sims_sorted[max(0, len(sims_sorted) // 4)]
-    p50 = sims_sorted[len(sims_sorted) // 2]
-    worst = sims_sorted[0]
-
-    score = 0.45 * mean(sims) + 0.30 * p50 + 0.15 * p25 + 0.10 * worst
+    avg_sim = mean(sims)  # Eq. (11)
+    dispersion = mean((sim - avg_sim) ** 2 for sim in sims)  # Eq. (12) core term
+    score = avg_sim * (1.0 - min(1.0, dispersion))
     return clamp(score, 0.0, 1.0)
 
 
-def link_stability_factor(
+def link_holding_time_factor(
     node: Node,
     nodes: Dict[int, Node],
     comm_radius_m: float,
     lht_cap_s: float,
 ) -> float:
-    nbrs = _valid_neighbor_ids(node, nodes)
+    """
+    Paper Eq. (14) is the average link holding time to neighbors. Because this
+    simulator combines factors in a bounded weighted utility and the RL state is
+    discretized on [0, 1], we retain the paper's averaging structure but cap the
+    raw LHT before normalization.
+    """
+    nbrs = _alive_neighbors(node, nodes)
     if not nbrs:
         return 0.0
 
     lhts = [link_holding_time_s(node, nodes[j], comm_radius_m) for j in nbrs]
-    stable = [min(x, lht_cap_s) / max(1e-9, lht_cap_s) for x in lhts]
-    stable_sorted = sorted(stable)
-
-    p25 = stable_sorted[max(0, len(stable_sorted) // 4)]
-    p50 = stable_sorted[len(stable_sorted) // 2]
-    worst = stable_sorted[0]
-
-    score = 0.40 * mean(stable) + 0.25 * p50 + 0.20 * p25 + 0.15 * worst
-    return clamp(score, 0.0, 1.0)
-
-
-def degree_centrality_factor(node: Node, nodes: Dict[int, Node]) -> float:
-    nbrs = _valid_neighbor_ids(node, nodes)
-    deg = len(nbrs)
-    if deg <= 0:
-        return 0.0
-
-    alive_nodes = [n for n in nodes.values() if n.e_j > 0]
-    if not alive_nodes:
-        return 0.0
-
-    max_deg = max(len(_valid_neighbor_ids(n, nodes)) for n in alive_nodes)
-    global_deg = deg / max(1, len(alive_nodes) - 1)
-    local_deg = deg / max(1, max_deg)
-
-    return clamp(0.40 * global_deg + 0.60 * local_deg, 0.0, 1.0)
-
-
-def connectivity_support_factor(
-    node: Node,
-    nodes: Dict[int, Node],
-    comm_radius_m: float,
-    lht_cap_s: float,
-) -> float:
-    nbrs = _valid_neighbor_ids(node, nodes)
-    if not nbrs:
-        return 0.0
-
-    supports: List[float] = []
-    for j in nbrs:
-        other = nodes[j]
-        if other.e_j <= 0:
-            continue
-        lht = link_holding_time_s(node, other, comm_radius_m)
-        lht_norm = min(lht, lht_cap_s) / max(1e-9, lht_cap_s)
-        energy = clamp(other.e_j / max(1e-9, other.e0_j), 0.0, 1.0)
-        supports.append(0.65 * lht_norm + 0.35 * energy)
-
-    if not supports:
-        return 0.0
-
-    supports.sort(reverse=True)
-    best = supports[0]
-    second = supports[1] if len(supports) > 1 else supports[0]
-    mean_support = mean(supports)
-
-    return clamp(0.30 * best + 0.25 * second + 0.45 * mean_support, 0.0, 1.0)
+    avg_lht = mean(min(x, lht_cap_s) for x in lhts)
+    return clamp(avg_lht / max(1e-9, lht_cap_s), 0.0, 1.0)
 
 
 @dataclass(frozen=True)
@@ -129,15 +96,12 @@ def compute_factors(
     lht_cap_s: float,
     v_max: float,
 ) -> UtilityFactors:
-    s1 = clamp(node.e_j / max(1e-9, node.e0_j), 0.0, 1.0)
+    del v_max  # kept for backward-compatible signature
 
-    base_degree = degree_centrality_factor(node, nodes)
-    connectivity = connectivity_support_factor(node, nodes, comm_radius_m, lht_cap_s)
-    s2 = clamp(0.78 * base_degree + 0.22 * connectivity, 0.0, 1.0)
-
-    s3 = mobility_stability_factor(node, nodes)
-    s4 = link_stability_factor(node, nodes, comm_radius_m, lht_cap_s)
-
+    s1 = residual_energy_factor(node)
+    s2 = degree_centrality_factor(node, nodes, n_total)
+    s3 = velocity_similarity_factor(node, nodes)
+    s4 = link_holding_time_factor(node, nodes, comm_radius_m, lht_cap_s)
     return UtilityFactors(s1, s2, s3, s4)
 
 

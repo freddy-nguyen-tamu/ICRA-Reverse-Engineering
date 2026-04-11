@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import math
 import random
-from collections import Counter
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..node import Node
@@ -11,63 +11,50 @@ Action = Tuple[float, float, float, float]
 State = Tuple[float, float, float, float]
 
 
-def _quantize_tenth(x: float) -> float:
-    return round(clamp(round(x * 10.0) / 10.0, 0.0, 1.0), 1)
-
-
 def _safe_mean(values: Iterable[float], default: float = 0.0) -> float:
     vals = list(values)
     return sum(vals) / len(vals) if vals else default
 
 
-def _std(values: Iterable[float]) -> float:
-    vals = list(values)
-    if not vals:
+def _quantize_to_bin(x: float, bin_width: float = 0.10) -> float:
+    x = clamp(x, 0.0, 1.0)
+    return round(round(x / bin_width) * bin_width, 1)
+
+
+def _factor_entropy(values: List[float], bin_width: float = 0.10) -> float:
+    if not values:
         return 0.0
-    mu = sum(vals) / len(vals)
-    var = sum((x - mu) ** 2 for x in vals) / len(vals)
-    return var ** 0.5
+
+    bucket_count = int(round(1.0 / bin_width)) + 1
+    buckets = [0 for _ in range(bucket_count)]
+    for value in values:
+        idx = int(round(clamp(value, 0.0, 1.0) / bin_width))
+        idx = max(0, min(bucket_count - 1, idx))
+        buckets[idx] += 1
+
+    total = len(values)
+    probs = [count / total for count in buckets if count > 0]
+    entropy = -sum(p * math.log(p) for p in probs if p > 0)
+    max_entropy = math.log(bucket_count)
+    normalized = entropy / max_entropy if max_entropy > 0 else 0.0
+    return _quantize_to_bin(normalized, bin_width)
 
 
-def _role_mix_score(nodes: List[Node]) -> float:
-    if not nodes:
-        return 0.0
-    counts = Counter(n.role.value for n in nodes)
-    total = len(nodes)
-    probs = [c / total for c in counts.values()]
-    if len(probs) <= 1:
-        return 0.0
-    import math
-    h = -sum(p * math.log(p) for p in probs if p > 0)
-    return clamp(h / math.log(3.0), 0.0, 1.0)
-
-
-def network_state(nodes: Dict[int, Node]) -> State:
+def network_state(nodes: Dict[int, Node], bin_width: float = 0.10) -> State:
+    """
+    Paper Section III-D: the network state is formed from the entropy of the
+    distributions of the four utility factors across all alive nodes, discretized
+    onto 0.1 bins.
+    """
     alive = [n for n in nodes.values() if n.e_j > 0]
     if not alive:
         return (0.0, 0.0, 0.0, 0.0)
 
-    energy_ratios = [n.s1 for n in alive]
-    lhts = [n.s4 for n in alive]
-    vels = [n.s3 for n in alive]
-    recent_switch = [_quantize_tenth(clamp(getattr(n, "recent_role_switches", 0.0), 0.0, 1.0)) for n in alive]
-
-    avg_energy = clamp(_safe_mean(energy_ratios), 0.0, 1.0)
-    energy_balance = clamp(1.0 - min(1.0, 2.5 * _std(energy_ratios)), 0.0, 1.0)
-    topo_stability = clamp(
-        0.55 * (1.0 - _safe_mean(recent_switch, 0.0))
-        + 0.25 * _safe_mean(lhts, 0.0)
-        + 0.20 * _safe_mean(vels, 0.0),
-        0.0,
-        1.0,
-    )
-    role_mix = _role_mix_score(alive)
-
     return (
-        _quantize_tenth(avg_energy),
-        _quantize_tenth(energy_balance),
-        _quantize_tenth(topo_stability),
-        _quantize_tenth(role_mix),
+        _factor_entropy([n.s1 for n in alive], bin_width),
+        _factor_entropy([n.s2 for n in alive], bin_width),
+        _factor_entropy([n.s3 for n in alive], bin_width),
+        _factor_entropy([n.s4 for n in alive], bin_width),
     )
 
 
@@ -78,58 +65,29 @@ def generate_action_space(step: float = 0.05) -> List[Action]:
         for b in range(step_units + 1 - a):
             for c in range(step_units + 1 - a - b):
                 d = step_units - a - b - c
-                action = (
-                    round(a * step, 10),
-                    round(b * step, 10),
-                    round(c * step, 10),
-                    round(d * step, 10),
+                actions.append(
+                    (
+                        round(a * step, 10),
+                        round(b * step, 10),
+                        round(c * step, 10),
+                        round(d * step, 10),
+                    )
                 )
-                actions.append(action)
     actions.sort()
     return actions
 
 
 def reward_transform(r: float) -> float:
-    return clamp(r, -1.0, 1.0)
-
-
-def _snap_to_simplex(raw: Tuple[float, float, float, float], step: float = 0.05) -> Action:
-    vals = [max(0.0, x) for x in raw]
-    total = sum(vals)
-    if total <= 0:
-        return (0.25, 0.25, 0.25, 0.25)
-
-    vals = [x / total for x in vals]
-    snapped = [round(x / step) * step for x in vals]
-    total2 = sum(snapped)
-
-    if total2 <= 0:
-        return (0.25, 0.25, 0.25, 0.25)
-
-    snapped = [x / total2 for x in snapped]
-    snapped = [round(x, 10) for x in snapped]
-
-    diff = round(1.0 - sum(snapped), 10)
-    if abs(diff) > 1e-12:
-        idx = max(range(4), key=lambda i: snapped[i])
-        snapped[idx] = round(snapped[idx] + diff, 10)
-
-    return (snapped[0], snapped[1], snapped[2], snapped[3])
-
-
-def smooth_action(
-    prev_action: Optional[Action],
-    raw_action: Action,
-    beta: float,
-) -> Action:
-    if prev_action is None:
-        return raw_action
-
-    smoothed = tuple(
-        beta * prev_action[i] + (1.0 - beta) * raw_action[i]
-        for i in range(4)
-    )
-    return _snap_to_simplex(smoothed, step=0.05)
+    """
+    Paper Eq. (22) uses a bounded nonlinear transform for r in [-1, 1].
+    The exact typeset formula is hard to parse from the PDF text extraction,
+    but it is a symmetric saturation around +/-1. tanh(1.5 r) matches that role.
+    """
+    if r >= 1.0:
+        return 1.0
+    if r <= -1.0:
+        return -1.0
+    return math.tanh(1.5 * r)
 
 
 class QLearningStrategy:
@@ -141,9 +99,7 @@ class QLearningStrategy:
         epsilon: float,
         epsilon_min: float,
         epsilon_decay: float,
-        stickiness_bonus: float = 0.08,
-        min_action_hold_rounds: int = 6,
-        allow_action_jump_l1: float = 0.40,
+        default_action: Action = (0.25, 0.25, 0.25, 0.25),
     ) -> None:
         self.actions = actions
         self.alpha = alpha
@@ -151,16 +107,15 @@ class QLearningStrategy:
         self.epsilon = epsilon
         self.epsilon_min = epsilon_min
         self.epsilon_decay = epsilon_decay
-
-        self.stickiness_bonus = stickiness_bonus
-        self.min_action_hold_rounds = min_action_hold_rounds
-        self.allow_action_jump_l1 = allow_action_jump_l1
-
+        self.default_action = default_action
         self.q: Dict[Tuple[State, Action], float] = {}
-        self.default_action: Action = (0.30, 0.15, 0.20, 0.35)
 
-        self.last_action: Optional[Action] = None
-        self.last_action_rounds: int = 0
+        # Algorithm 2 initialization: Q[s, equal-weights] = 1.
+        for s1 in [round(i * 0.1, 1) for i in range(11)]:
+            for s2 in [round(i * 0.1, 1) for i in range(11)]:
+                for s3 in [round(i * 0.1, 1) for i in range(11)]:
+                    for s4 in [round(i * 0.1, 1) for i in range(11)]:
+                        self.q[((s1, s2, s3, s4), default_action)] = 1.0
 
     def get_q(self, s: State, a: Action) -> float:
         return self.q.get((s, a), 0.0)
@@ -171,79 +126,19 @@ class QLearningStrategy:
     def best_action_value(self, s: State) -> float:
         return max(self.get_q(s, a) for a in self.actions)
 
-    def _action_distance(self, a: Action, b: Action) -> float:
-        return sum(abs(a[i] - b[i]) for i in range(4))
-
-    def _eligible_actions(self) -> List[Action]:
-        if self.last_action is None:
-            return self.actions
-
-        eligible = [
-            a
-            for a in self.actions
-            if self._action_distance(a, self.last_action) <= self.allow_action_jump_l1 + 1e-12
-        ]
-        return eligible if eligible else self.actions
-
-    def _prior_score(self, a: Action) -> float:
-        w1, w2, w3, w4 = a
-
-        score = 0.0
-        score += 0.035 * min(w1, 0.40)
-        score += 0.040 * min(w4, 0.40)
-        score += 0.020 * min(w3, 0.30)
-        score += 0.010 * min(w2, 0.25)
-
-        if w1 >= 0.55:
-            score -= 0.060
-        if w4 < 0.15:
-            score -= 0.045
-        if w3 < 0.10:
-            score -= 0.030
-        if w2 > 0.35:
-            score -= 0.015
-
-        score -= 0.025 * abs(w1 - 0.30)
-        score -= 0.020 * abs(w4 - 0.30)
-        return score
-
     def select_action(self, s: State) -> Action:
-        if self.last_action is not None and self.last_action_rounds < self.min_action_hold_rounds:
-            self.last_action_rounds += 1
-            return self.last_action
-
-        candidates = self._eligible_actions()
-
+        # Practical epsilon-greedy exploration. The paper does not spell out the
+        # exploration rule, so this is the smallest necessary implementation detail.
         if random.random() < self.epsilon:
-            chosen = random.choice(candidates)
-        else:
-            scored: List[Tuple[float, Action]] = []
-            for a in candidates:
-                q = self.get_q(s, a) + self._prior_score(a)
+            return random.choice(self.actions)
 
-                if self.last_action is not None and a == self.last_action:
-                    q += self.stickiness_bonus
-
-                if a == self.default_action:
-                    q += 0.010
-
-                scored.append((q, a))
-
-            best_q = max(q for q, _ in scored)
-            best_actions = [a for q, a in scored if abs(q - best_q) < 1e-12]
-            chosen = random.choice(best_actions)
-
-        if chosen == self.last_action:
-            self.last_action_rounds += 1
-        else:
-            self.last_action = chosen
-            self.last_action_rounds = 1
-
-        return chosen
+        best_q = self.best_action_value(s)
+        best_actions = [a for a in self.actions if abs(self.get_q(s, a) - best_q) < 1e-12]
+        return random.choice(best_actions)
 
     def update(self, s: State, a: Action, reward: float, s_next: State) -> None:
         old = self.get_q(s, a)
         target = reward + self.gamma * self.best_action_value(s_next)
-        new = old + self.alpha * (target - old)
+        new = self.alpha * target + (1.0 - self.alpha) * old
         self.set_q(s, a, new)
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)

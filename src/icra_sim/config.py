@@ -17,7 +17,7 @@ class SimConfig:
     clustering_interval_s: int = 2
 
     # ------------------------------------------------------------------
-    # Area and radio
+    # Area and radio (Table II)
     # ------------------------------------------------------------------
     area_km: Tuple[float, float] = (10.0, 10.0)
     comm_radius_km: float = 1.0
@@ -29,144 +29,107 @@ class SimConfig:
     speed_noise_std: float = 0.25
     heading_noise_std: float = 0.015
 
+    # A lightweight approximation of the paper's reference-point-group motion:
+    # nodes are initialized around a small number of group centers and their
+    # Gauss-Markov motion is weakly pulled back toward those centers.
+    use_grouped_init: bool = True
+    group_anchor_pull: float = 0.035
+    group_spread_frac_of_radius: float = 0.34
+
     # ------------------------------------------------------------------
-    # Traffic
+    # Traffic / packet model
     # ------------------------------------------------------------------
     packet_gen_prob_per_s: float = 0.020
     packet_size_bytes: int = 512
     data_rate_kbps: int = 1000
 
-    per_hop_processing_delay_s: float = 0.00075
-    mac_contention_delay_s: float = 0.00060
-    queueing_delay_s: float = 0.00080
+    # These delays are implementation choices for the lightweight simulator.
+    # They are intentionally larger than the old millisecond-scale model so the
+    # QoS curves do not collapse to a nearly constant band.
+    per_hop_processing_delay_s: float = 0.0025
+    mac_contention_delay_s: float = 0.0030
+    queueing_delay_s: float = 0.0150
+    ctrl_proc_delay_s: float = 0.0012
+    distance_delay_scale_s: float = 0.0020
+    congestion_delay_scale_s: float = 0.0040
     max_hops: int = 30
 
+    # Moderate packet success model: OPNET would naturally induce losses from
+    # congestion / topology; this lightweight simulator needs an explicit proxy.
+    link_success_floor: float = 0.72
+    link_success_exponent: float = 1.2
+    hop_congestion_loss_scale: float = 0.08
+
     # ------------------------------------------------------------------
-    # Energy – make packet costs negligible, steady-state consumption dominant
+    # Energy (Table II)
     # ------------------------------------------------------------------
-    ehf_j_per_s: float = 2.0      # cluster-head base consumption (paper E_hf)
-    e_forwarder_j_per_s: float = 1.45  # inter-cluster forwarder: high but below CH (paper: heavy relay, not full CH load)
-    en_j_per_s: float = 1.0       # ordinary node base consumption (paper E_n)
-    # Baselines use fixed weights; ICRA adapts weights toward residual energy — slight CH drain tilt reproduces paper lifetime ordering.
-    icra_ch_drain_scale: float = 1.0
-    dca_ch_drain_scale: float = 1.16
-    wca_ch_drain_scale: float = 1.20
-    icra_forwarder_drain_scale: float = 1.0
-    dca_forwarder_drain_scale: float = 1.09
-    wca_forwarder_drain_scale: float = 1.11
+    ehf_j_per_s: float = 2.0   # CH / forwarding node energy rate E_hf
+    en_j_per_s: float = 1.0    # common member energy rate E_n
 
-    # Packet costs – very small, so lifetime is determined by role, not traffic
-    e_tx_j: float = 0.002
-    e_rx_j: float = 0.001
-    e_ch_proc_j: float = 0.0005
-
-    # kept for compatibility (no effect when packet costs are tiny)
-    ch_idle_extra_j_per_s: float = 1.0
-    forwarder_idle_extra_j_per_s: float = 1.0
-
-    e_ch_backbone_tx_j: float = 0.0
-    e_forwarder_backbone_tx_j: float = 0.0
-    e_ch_service_rx_j: float = 0.0
-    e_forwarder_backbone_rx_j: float = 0.0
-    e_ch_service_proc_j: float = 0.0
-    e_forwarder_proc_j: float = 0.0
-    e_path_reuse_surcharge_j: float = 0.0
-
-    load_energy_scale_j: float = 0.0
-    relay_load_energy_scale_j: float = 0.0
-    path_reuse_energy_scale_j: float = 0.0
+    # Packet-level energy is no longer forced to be negligible.
+    e_tx_j: float = 0.020
+    e_rx_j: float = 0.010
+    e_proc_j: float = 0.005
 
     control_packet_size_bytes: int = 64
     e_ctrl_tx_j: float = 0.002
     e_ctrl_rx_j: float = 0.001
-    ctrl_proc_delay_s: float = 0.00012
 
     # ------------------------------------------------------------------
-    # Clustering – encourage fewer CHs, stronger retention, aggressive merging
+    # Clustering / RL (paper notation)
     # ------------------------------------------------------------------
-    lht_threshold_s: float = 0.10
-    lht_cap_s: float = 120.0
+    sigma_lht_threshold_s: float = 0.10
+    phi_role_change_threshold: int = 2
 
-    join_hysteresis_margin: float = 0.20
-    ch_retain_margin: float = 0.18
-    min_ch_tenure_s: float = 16.0
-    max_cluster_members: int = 40
-
-    min_ch_neighbor_count: int = 2
-    prefer_connected_ch_bonus: float = 0.10
-    isolated_ch_penalty: float = 0.20
-
-    min_gateway_lht_s: float = 0.20
-    forwarder_reuse_bonus: float = 0.01
-
-    gateway_crosslink_weight: float = 0.50
-    gateway_utility_weight: float = 0.15
-    gateway_energy_weight: float = 0.15
-    gateway_stability_weight: float = 0.20
-    gateway_multicluster_bonus: float = 0.03
-    direct_ch_link_bonus: float = 0.02
-
-    ch_energy_guard_ratio: float = 0.32
-    ch_cooldown_s: float = 8.0
-    recent_ch_penalty_weight: float = 0.08
-    traffic_load_penalty_weight: float = 0.03
-    degree_balance_bonus_weight: float = 0.05
-    tenure_stability_bonus_weight: float = 0.06
-    link_stability_bonus_weight: float = 0.06
-    velocity_stability_bonus_weight: float = 0.05
-    local_degree_target: float = 0.60
-    local_degree_tolerance: float = 0.25
-
-    # ------------------------------------------------------------------
-    # RL
-    # ------------------------------------------------------------------
-    reward_lambda: float = 0.8
-    role_change_threshold: int = 2
+    # Hybrid reward: keep the paper's role-change / energy emphasis, but add
+    # routing feedback because the paper explicitly says strategy adjustment uses
+    # the previous routing result as feedback.
+    reward_lambda: float = 0.58
+    reward_qos_weight: float = 0.22
+    reward_isolation_weight: float = 0.12
+    reward_cluster_penalty_weight: float = 0.08
 
     q_alpha: float = 0.18
     q_gamma: float = 0.0
-    q_epsilon: float = 0.05
-    q_epsilon_min: float = 0.01
-    q_epsilon_decay: float = 0.998
+    q_epsilon: float = 0.10
+    q_epsilon_min: float = 0.02
+    q_epsilon_decay: float = 0.997
     q_step: float = 0.05
+    state_bin: float = 0.10
 
-    action_stickiness_bonus: float = 0.0
-    min_action_hold_rounds: int = 1
-    weight_smoothing_beta: float = 0.08
-    allow_action_jump_l1: float = 0.70
+    # A practical implementation detail omitted by the paper: start from equal weights.
+    initial_icra_weights: Tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
 
-    reward_role_changes_weight: float = 0.80
-    reward_energy_weight: float = 0.20
-    reward_pdr_weight: float = 0.0
-    reward_delay_weight: float = 0.0
-    reward_isolation_weight: float = 0.0
-    reward_balance_weight: float = 0.0
-    reward_survival_weight: float = 0.0
+    # To keep the four utility terms on a comparable scale in this lightweight
+    # implementation, the link holding time term is clipped to a finite window
+    # before normalization. This removes the old percentile heuristic but still
+    # avoids unbounded dominance by very large LHT values.
+    lht_cap_s: float = 120.0
 
-    recent_role_change_decay: float = 0.88
-    traffic_load_decay: float = 0.88
-    relay_load_decay: float = 0.88
-    path_reuse_decay: float = 0.88
-    cooldown_decay_per_round_s: float = 2.0
-    clustering_warmup_rounds: int = 1
+    # Practical clustering guards that approximate missing simulator detail
+    # without reverting to anchored RL or non-paper utility factors.
+    icra_min_cluster_size: int = 3
+    icra_max_cluster_members: int = 40
+    icra_join_hysteresis_margin: float = 0.16
+    icra_ch_retain_margin: float = 0.12
+    icra_min_ch_tenure_s: float = 12.0
+    icra_min_ch_neighbor_count: int = 2
+    icra_ch_energy_guard_ratio: float = 0.20
+    icra_degree_balance_bonus_weight: float = 0.05
+    icra_tenure_stability_bonus_weight: float = 0.05
+    icra_link_stability_bonus_weight: float = 0.05
+    icra_velocity_stability_bonus_weight: float = 0.04
+    icra_recent_ch_penalty_weight: float = 0.06
+    icra_traffic_load_penalty_weight: float = 0.04
+    icra_local_degree_target: float = 0.58
+    icra_local_degree_tolerance: float = 0.28
 
-    # ------------------------------------------------------------------
-    # Metric model knobs (unchanged)
-    # ------------------------------------------------------------------
-    icra_cluster_time_base_s: float = 0.30
-    icra_cluster_time_per_node_s: float = 0.0012
-    dca_cluster_time_base_s: float = 0.36
-    dca_cluster_time_per_node_s: float = 0.0011
-    wca_cluster_time_base_s: float = 0.30
-    wca_cluster_time_per_node_s: float = 0.0120
+    # Runtime-field decay between clustering rounds.
+    traffic_load_decay: float = 0.92
+    relay_load_decay: float = 0.90
+    recent_role_change_decay: float = 0.85
 
-    icra_backbone_queue_scale: float = 1.0
-    dca_backbone_queue_scale: float = 1.0
-    wca_backbone_queue_scale: float = 1.0
-    icra_backbone_loss_bias: float = 0.0
-    dca_backbone_loss_bias: float = 0.0
-    wca_backbone_loss_bias: float = 0.0
-
+    # Reproducibility
     seed: int = 7
 
     @property
