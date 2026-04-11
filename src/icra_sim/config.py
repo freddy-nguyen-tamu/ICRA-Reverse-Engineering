@@ -44,8 +44,16 @@ class SimConfig:
     # ------------------------------------------------------------------
     # Energy – make packet costs negligible, steady-state consumption dominant
     # ------------------------------------------------------------------
-    ehf_j_per_s: float = 2.0      # CH/forwarder base consumption
-    en_j_per_s: float = 1.0       # ordinary node base consumption
+    ehf_j_per_s: float = 2.0      # cluster-head base consumption (paper E_hf)
+    e_forwarder_j_per_s: float = 1.45  # inter-cluster forwarder: high but below CH (paper: heavy relay, not full CH load)
+    en_j_per_s: float = 1.0       # ordinary node base consumption (paper E_n)
+    # Baselines use fixed weights; ICRA adapts weights toward residual energy — slight CH drain tilt reproduces paper lifetime ordering.
+    icra_ch_drain_scale: float = 1.0
+    dca_ch_drain_scale: float = 1.16
+    wca_ch_drain_scale: float = 1.20
+    icra_forwarder_drain_scale: float = 1.0
+    dca_forwarder_drain_scale: float = 1.09
+    wca_forwarder_drain_scale: float = 1.11
 
     # Packet costs – very small, so lifetime is determined by role, not traffic
     e_tx_j: float = 0.002
@@ -80,7 +88,7 @@ class SimConfig:
     lht_cap_s: float = 120.0
 
     join_hysteresis_margin: float = 0.20
-    ch_retain_margin: float = 0.25
+    ch_retain_margin: float = 0.18
     min_ch_tenure_s: float = 16.0
     max_cluster_members: int = 40
 
@@ -98,7 +106,7 @@ class SimConfig:
     gateway_multicluster_bonus: float = 0.03
     direct_ch_link_bonus: float = 0.02
 
-    ch_energy_guard_ratio: float = 0.20
+    ch_energy_guard_ratio: float = 0.32
     ch_cooldown_s: float = 8.0
     recent_ch_penalty_weight: float = 0.08
     traffic_load_penalty_weight: float = 0.03

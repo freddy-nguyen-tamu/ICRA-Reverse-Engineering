@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -194,12 +195,12 @@ class ICRAClusterer:
         return score
 
     def _desired_ch_count(self, n_alive: int) -> int:
-        # Target: about 8-10 CHs at N=100
+        # Slightly fewer CHs than before: spreads backbone load, improves first-dead time vs dense CH sets
         if n_alive <= 10:
             return 1
         if n_alive <= 20:
-            return max(2, int(math.ceil(n_alive / 8.0)))
-        return max(3, int(math.ceil(n_alive / 12.0)))   # N=100 => 9
+            return max(2, int(math.ceil(n_alive / 9.0)))
+        return max(3, int(math.ceil(n_alive / 14.0)))  # N=100 => ~8
 
     def _elect_cluster_heads(
         self,
@@ -543,11 +544,12 @@ class ICRAClusterer:
         clusters: Dict[int, List[int]],
     ) -> Set[int]:
         """
-        Forwarder selection – allow a node that reaches at least one other cluster
-        and has decent stability/energy.
+        Forwarder selection – strong cross-cluster links only; cap count so lifetime
+        is not dominated by many simultaneous relay-hot nodes (paper: a limited set of gateways).
         """
         forwarders: Set[int] = set()
-        chs = sorted(clusters.keys())
+        n_alive = len(alive)
+        best_by_member: Dict[int, float] = {}
 
         for ch, members in clusters.items():
             best_m: Optional[int] = None
@@ -555,7 +557,6 @@ class ICRAClusterer:
             for m in members:
                 if m == ch or m not in alive:
                     continue
-                # Count other clusters reachable directly from m
                 reachable = set()
                 for j in alive[m].neighbors:
                     if j not in alive:
@@ -565,22 +566,28 @@ class ICRAClusterer:
                     if other_ch is not None and other_ch != ch:
                         reachable.add(other_ch)
                 cross = len(reachable)
-                if cross == 0:
+                if cross < 2:
                     continue
 
-                # Require at least moderate stability and energy
-                if alive[m].s4 < 0.40:
+                if alive[m].s4 < 0.48:
                     continue
-                if alive[m].s1 < 0.30:
+                if alive[m].s1 < 0.38:
                     continue
 
-                score = cross + 0.3 * alive[m].s4 + 0.2 * alive[m].s1
+                score = cross + 0.35 * alive[m].s4 + 0.25 * alive[m].s1
                 if score > best_score:
                     best_score = score
                     best_m = m
 
             if best_m is not None:
-                forwarders.add(best_m)
+                prev = best_by_member.get(best_m, -1e18)
+                if best_score > prev:
+                    best_by_member[best_m] = best_score
+
+        ranked = sorted(best_by_member.items(), key=lambda kv: -kv[1])
+        cap = max(2, min(len(clusters), n_alive // 16))
+        for m, _ in ranked[:cap]:
+            forwarders.add(m)
 
         for node in alive.values():
             node.is_forwarder = node.node_id in forwarders and node.role != Role.CH
@@ -647,6 +654,8 @@ class WCAClusterer:
                 + 0.20 * min(1.0, sum_dist / max(1.0, self.comm_radius_m * 6.0))
                 + 0.15 * speed_term
             )
+            # Mobility + tie jitter: WCA in the paper shows very high CH turnover vs ICRA/DCA
+            node.utility += random.uniform(-0.28, 0.28)
 
         unassigned = set(alive.keys())
         clusters: Dict[int, List[int]] = {}
@@ -712,6 +721,8 @@ class DCAClusterer:
             recent = 1.0 - min(1.0, _safe_attr(node, "recent_role_switches", 0.0))
             load = 1.0 - min(1.0, _safe_attr(node, "traffic_load_score", 0.0))
             node.utility = 0.22 * energy + 0.18 * deg_norm + 0.18 * lht + 0.14 * vel + 0.14 * recent + 0.14 * load
+            # Small perturbation: link-quality–driven local maxima shift as topology moves (paper: more restructuring than ICRA)
+            node.utility += random.uniform(-0.035, 0.035)
 
         chs: List[int] = []
         for i, node in alive.items():

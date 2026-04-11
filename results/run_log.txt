@@ -1,0 +1,172 @@
+Running: scenario=case1 N=10 protocol=icra
+Running: scenario=case1 N=10 protocol=wca
+Running: scenario=case1 N=10 protocol=dca
+
+--- Consistency check for case1 N=10 ---
+✗ Cluster cost: dca is fastest, expected ICRA
+  (WCA is not the slowest – check)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA has the most, as expected)
+✓ Network lifetime: ICRA is the best (good)
+✗ Isolation clusters: wca has the fewest, expected ICRA
+----------------------------------------
+
+Running: scenario=case1 N=20 protocol=icra
+Running: scenario=case1 N=20 protocol=wca
+Running: scenario=case1 N=20 protocol=dca
+
+--- Consistency check for case1 N=20 ---
+✗ Cluster cost: dca is fastest, expected ICRA
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA has the most, as expected)
+✓ Network lifetime: ICRA is the best (good)
+✗ Isolation clusters: wca has the fewest, expected ICRA
+----------------------------------------
+
+Running: scenario=case1 N=50 protocol=icra
+Running: scenario=case1 N=50 protocol=wca
+Running: scenario=case1 N=50 protocol=dca
+
+--- Consistency check for case1 N=50 ---
+✗ Cluster cost: dca is fastest, expected ICRA
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA has the most, as expected)
+✓ Network lifetime: ICRA is the best (good)
+✓ Isolation clusters: ICRA has the fewest (good)
+✗ Delay: ICRA delay is much higher than WCA
+  (ICRA and DCA delays are similar, as expected)
+----------------------------------------
+
+Running: scenario=case1 N=100 protocol=icra
+Running: scenario=case1 N=100 protocol=wca
+Running: scenario=case1 N=100 protocol=dca
+
+--- Consistency check for case1 N=100 ---
+✗ Cluster cost: dca is fastest, expected ICRA
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA has the most, as expected)
+✓ Network lifetime: ICRA is the best (good)
+✓ Isolation clusters: ICRA has the fewest (good)
+✓ Delay: ICRA delay is reasonable compared to WCA
+  (ICRA and DCA delays differ significantly)
+----------------------------------------
+
+Running: scenario=case2 N=10 protocol=icra
+Running: scenario=case2 N=10 protocol=wca
+Running: scenario=case2 N=10 protocol=dca
+
+--- Consistency check for case2 N=10 ---
+✓ Cluster cost: ICRA is fastest (good)
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA has the most, as expected)
+✓ Network lifetime: ICRA is the best (good)
+✓ Isolation clusters: ICRA has the fewest (good)
+----------------------------------------
+
+Running: scenario=case2 N=20 protocol=icra
+Running: scenario=case2 N=20 protocol=wca
+Running: scenario=case2 N=20 protocol=dca
+
+--- Consistency check for case2 N=20 ---
+✗ Cluster cost: dca is fastest, expected ICRA
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA has the most, as expected)
+✓ Network lifetime: ICRA is the best (good)
+✓ Isolation clusters: ICRA has the fewest (good)
+----------------------------------------
+
+Running: scenario=case2 N=50 protocol=icra
+Running: scenario=case2 N=50 protocol=wca
+Running: scenario=case2 N=50 protocol=dca
+
+--- Consistency check for case2 N=50 ---
+✗ Cluster cost: dca is fastest, expected ICRA
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA has the most, as expected)
+✓ Network lifetime: ICRA is the best (good)
+✓ Isolation clusters: ICRA has the fewest (good)
+✓ Delay: ICRA delay is reasonable compared to WCA
+  (ICRA and DCA delays are similar, as expected)
+----------------------------------------
+
+Running: scenario=case2 N=100 protocol=icra
+Running: scenario=case2 N=100 protocol=wca
+Running: scenario=case2 N=100 protocol=dca
+
+--- Consistency check for case2 N=100 ---
+✗ Cluster cost: dca is fastest, expected ICRA
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA has the most, as expected)
+✓ Network lifetime: ICRA is the best (good)
+✓ Isolation clusters: ICRA has the fewest (good)
+✓ Delay: ICRA delay is reasonable compared to WCA
+  (ICRA and DCA delays are similar, as expected)
+----------------------------------------
+
+Running: scenario=case3 N=10 protocol=icra
+Running: scenario=case3 N=10 protocol=wca
+Running: scenario=case3 N=10 protocol=dca
+
+--- Consistency check for case3 N=10 ---
+✓ Cluster cost: ICRA is fastest (good)
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA has the most, as expected)
+✓ Network lifetime: ICRA is the best (good)
+✓ Isolation clusters: ICRA has the fewest (good)
+----------------------------------------
+
+Running: scenario=case3 N=20 protocol=icra
+Running: scenario=case3 N=20 protocol=wca
+Running: scenario=case3 N=20 protocol=dca
+
+--- Consistency check for case3 N=20 ---
+✓ Cluster cost: ICRA is fastest (good)
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA does not have the most role changes)
+✓ Network lifetime: ICRA is the best (good)
+✓ Isolation clusters: ICRA has the fewest (good)
+----------------------------------------
+
+Running: scenario=case3 N=50 protocol=icra
+Running: scenario=case3 N=50 protocol=wca
+Running: scenario=case3 N=50 protocol=dca
+
+--- Consistency check for case3 N=50 ---
+✗ Cluster cost: dca is fastest, expected ICRA
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA does not have the most role changes)
+✓ Network lifetime: ICRA is the best (good)
+✓ Isolation clusters: ICRA has the fewest (good)
+✓ Delay: ICRA delay is reasonable compared to WCA
+  (ICRA and DCA delays are similar, as expected)
+✓ PDR: DCA has the lowest PDR in case3 (expected)
+  (ICRA and WCA PDR are similar, good)
+----------------------------------------
+
+Running: scenario=case3 N=100 protocol=icra
+Running: scenario=case3 N=100 protocol=wca
+Running: scenario=case3 N=100 protocol=dca
+
+--- Consistency check for case3 N=100 ---
+✓ Cluster cost: ICRA is fastest (good)
+  (WCA is the slowest, as expected)
+✓ Role changes: ICRA has the fewest (good)
+  (WCA does not have the most role changes)
+✓ Network lifetime: ICRA is the best (good)
+✓ Isolation clusters: ICRA has the fewest (good)
+✓ Delay: ICRA delay is reasonable compared to WCA
+  (ICRA and DCA delays are similar, as expected)
+✗ PDR: DCA is not clearly the worst in case3
+  (ICRA and WCA PDR differ more than expected)
+----------------------------------------
+

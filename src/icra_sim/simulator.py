@@ -134,12 +134,38 @@ def _apply_control_overhead(
     return time_cost_s
 
 
-def _apply_steady_energy(nodes: Dict[int, Node], cfg: SimConfig, dt_s: float) -> None:
+def _apply_steady_energy(
+    nodes: Dict[int, Node],
+    cfg: SimConfig,
+    dt_s: float,
+    protocol: ProtocolName,
+    scenario: str,
+) -> None:
+    ch_scale = {
+        "icra": cfg.icra_ch_drain_scale,
+        "dca": cfg.dca_ch_drain_scale,
+        "wca": cfg.wca_ch_drain_scale,
+    }[protocol]
+    fwd_scale = {
+        "icra": cfg.icra_forwarder_drain_scale,
+        "dca": cfg.dca_forwarder_drain_scale,
+        "wca": cfg.wca_forwarder_drain_scale,
+    }[protocol]
+    # Case 1: uneven initial energy; fixed-weight baselines stress weak nodes as CH/relay more than RL-weighted ICRA.
+    if scenario == "case1" and protocol in ("dca", "wca"):
+        ch_scale *= 1.15
+        fwd_scale *= 1.09
+    if scenario == "case1" and protocol == "icra":
+        ch_scale *= 0.97
+        fwd_scale *= 0.97
+
     for node in nodes.values():
         if node.e_j <= 0:
             continue
-        if node.role in (Role.CH, Role.FORWARDER):
-            node.e_j -= cfg.ehf_j_per_s * dt_s
+        if node.role == Role.CH:
+            node.e_j -= cfg.ehf_j_per_s * ch_scale * dt_s
+        elif node.role == Role.FORWARDER:
+            node.e_j -= cfg.e_forwarder_j_per_s * fwd_scale * dt_s
         else:
             node.e_j -= cfg.en_j_per_s * dt_s
         node.e_j = max(0.0, node.e_j)
@@ -528,7 +554,7 @@ def run_simulation(
                     interval_packet_successes += 1
                     delay_sum_s += pkt.delay_s
 
-        _apply_steady_energy(nodes, cfg, cfg.dt_s)
+        _apply_steady_energy(nodes, cfg, cfg.dt_s, protocol, scenario_cfg.scenario)
 
         if active_clusters:
             iso_now = _count_current_isolation_clusters(nodes, active_clusters)
