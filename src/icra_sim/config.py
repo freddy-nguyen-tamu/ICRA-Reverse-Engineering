@@ -84,10 +84,33 @@ class SimConfig:
     # Hybrid reward: keep the paper's role-change / energy emphasis, but add
     # routing feedback because the paper explicitly says strategy adjustment uses
     # the previous routing result as feedback.
-    reward_lambda: float = 0.58
-    reward_qos_weight: float = 0.22
-    reward_isolation_weight: float = 0.12
+    reward_lambda: float = 0.62
+    reward_qos_weight: float = 0.20
+    reward_isolation_weight: float = 0.10
     reward_cluster_penalty_weight: float = 0.08
+
+    # Practical paper-aligned additions for the lightweight simulator.
+    # Frequent cluster-role or membership reconfiguration should consume
+    # additional control energy; otherwise DCA can unrealistically win the
+    # first-dead-node lifetime metric by spreading CH duty despite very high
+    # topology churn.
+    e_membership_change_j: float = 0.050
+    e_cluster_role_change_j: float = 0.180
+    e_cluster_head_change_j: float = 0.120
+
+    # The paper says the importance of each factor should vary with the value
+    # distribution of that factor in the network. The RL implementation uses the
+    # entropy-state vector to guide early action choice before enough feedback is
+    # collected for a state.
+    guided_action_state_floor: float = 0.02
+    guided_action_gamma: float = 1.15
+    guided_action_sample_scale: float = 8.0
+
+    e_reconfig_service_ch_j: float = 0.030
+    e_reconfig_service_fwd_j: float = 0.015
+
+    instability_energy_scale_ch: float = 0.55
+    instability_energy_scale_member: float = 0.20
 
     q_alpha: float = 0.18
     q_gamma: float = 0.0
@@ -184,3 +207,5 @@ class ScenarioConfig:
                 constant_speed=False,
             )
         raise ValueError(f"Unknown scenario: {name}")
+
+

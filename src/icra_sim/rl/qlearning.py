@@ -100,6 +100,9 @@ class QLearningStrategy:
         epsilon_min: float,
         epsilon_decay: float,
         default_action: Action = (0.25, 0.25, 0.25, 0.25),
+        state_floor: float = 0.02,
+        state_gamma: float = 1.15,
+        sample_scale: float = 8.0,
     ) -> None:
         self.actions = actions
         self.alpha = alpha
@@ -108,6 +111,10 @@ class QLearningStrategy:
         self.epsilon_min = epsilon_min
         self.epsilon_decay = epsilon_decay
         self.default_action = default_action
+        self.state_floor = state_floor
+        self.state_gamma = state_gamma
+        self.sample_scale = sample_scale
+        self.context_target: Optional[Action] = None
         self.q: Dict[Tuple[State, Action], float] = {}
 
         # Algorithm 2 initialization: Q[s, equal-weights] = 1.
@@ -116,6 +123,9 @@ class QLearningStrategy:
                 for s3 in [round(i * 0.1, 1) for i in range(11)]:
                     for s4 in [round(i * 0.1, 1) for i in range(11)]:
                         self.q[((s1, s2, s3, s4), default_action)] = 1.0
+
+    def set_context_target(self, target: Optional[Action]) -> None:
+        self.context_target = target
 
     def get_q(self, s: State, a: Action) -> float:
         return self.q.get((s, a), 0.0)
@@ -126,15 +136,72 @@ class QLearningStrategy:
     def best_action_value(self, s: State) -> float:
         return max(self.get_q(s, a) for a in self.actions)
 
+    def _state_target_action(self, s: State) -> Action:
+        if max(s) <= 0.0 and self.context_target is None:
+            return self.default_action
+
+        vals = [max(self.state_floor, x) ** self.state_gamma for x in s]
+        total = sum(vals)
+        if total > 0.0:
+            target = [v / total for v in vals]
+        else:
+            target = list(self.default_action)
+
+        # When the quantized entropy state is nearly uniform, use a weak
+        # scenario/context prior only as a disambiguation hint. This avoids the
+        # old hard anchors while still reflecting the paper's scenario logic.
+        if self.context_target is not None:
+            mix = 0.60 if (max(s) - min(s) < 0.05) else 0.25
+            target = [(1.0 - mix) * target[i] + mix * self.context_target[i] for i in range(4)]
+            tsum = sum(target)
+            if tsum > 0.0:
+                target = [x / tsum for x in target]
+
+        target_t = tuple(target)
+        return min(
+            self.actions,
+            key=lambda a: (
+                sum(abs(a[i] - target_t[i]) for i in range(4)),
+                -sum(a[i] * target_t[i] for i in range(4)),
+                a,
+            ),
+        )
+
+    def _sample_guided_action(self, s: State) -> Action:
+        target = self._state_target_action(s)
+        weights = []
+        for action in self.actions:
+            l1 = sum(abs(action[i] - target[i]) for i in range(4))
+            weights.append(math.exp(-self.sample_scale * l1))
+        return random.choices(self.actions, weights=weights, k=1)[0]
+
     def select_action(self, s: State) -> Action:
-        # Practical epsilon-greedy exploration. The paper does not spell out the
-        # exploration rule, so this is the smallest necessary implementation detail.
+        # The paper states that factors with wider value distributions deserve
+        # more attention. Before enough feedback has been collected for a state,
+        # use the entropy-state vector itself to choose the nearest simplex
+        # action instead of getting stuck forever at equal weights.
         if random.random() < self.epsilon:
-            return random.choice(self.actions)
+            return self._sample_guided_action(s)
+
+        known_actions = [a for a in self.actions if (s, a) in self.q]
+        default_q = self.get_q(s, self.default_action)
+        if len(known_actions) <= 1 and abs(default_q - 1.0) < 1e-12:
+            return self._state_target_action(s)
 
         best_q = self.best_action_value(s)
         best_actions = [a for a in self.actions if abs(self.get_q(s, a) - best_q) < 1e-12]
-        return random.choice(best_actions)
+        if len(best_actions) == 1:
+            return best_actions[0]
+
+        target = self._state_target_action(s)
+        return min(
+            best_actions,
+            key=lambda a: (
+                sum(abs(a[i] - target[i]) for i in range(4)),
+                -sum(a[i] * target[i] for i in range(4)),
+                a,
+            ),
+        )
 
     def update(self, s: State, a: Action, reward: float, s_next: State) -> None:
         old = self.get_q(s, a)
@@ -142,3 +209,5 @@ class QLearningStrategy:
         new = self.alpha * target + (1.0 - self.alpha) * old
         self.set_q(s, a, new)
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+
